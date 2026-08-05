@@ -27,9 +27,6 @@
   "publishConfig": {
     "access": "public"
   },
-  "engines": {
-    "node": ">=22.6"
-  },
   "scripts": {
     "check": "npm run test && tsc --noEmit && oxlint && oxfmt --check .",
     "test": "node extensions/detector.ts",
@@ -47,6 +44,9 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22.6"
   },
   "pi": {
     "extensions": [
