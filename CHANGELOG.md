@@ -2,6 +2,19 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.0.5] — 2026-08-05
+
+### Added
+
+- **`/loopcheck suspend` / `resume`** — escape hatch: pause detection until the next prompt when repetition is intentional (polling, retrying a deploy). No env restart needed.
+- **Session counters** — `steers`/`aborts` appear in `/loopcheck` status; session-scoped (survive per-prompt resets, reset on `/loopcheck reset` or new session).
+- Fixture for the live regex-repeat capture (`parameter\s+(\S+)\s+("` 3× in one message) — regression-covered via the within-message signal.
+- `CHANGELOG.md` ships in the tarball.
+
+### Tests
+
+- 72 → 75: suspend/resume lifecycle, session counters, regex-repeat fixture, `/loopcheck` subcommands.
+
 ## [0.0.4] — 2026-08-05
 
 ### Added
@@ -65,7 +78,7 @@ All notable changes to **pi-anti-doom-loop**.
 - GitHub Actions release workflow: quality gate → version bump guard → dry-run → publish, triggered by `v*` tags.
 - `pi-package` keyword + `pi` manifest for the pi.dev gallery.
 
+[0.0.5]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.3...v0.0.4
-[0.0.3]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/irfndi/pi-anti-doom-loop/releases/tag/v0.0.1
