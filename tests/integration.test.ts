@@ -19,6 +19,7 @@ function makeFakePi() {
     string,
     { description?: string; handler: (args: string, ctx: any) => unknown }
   >();
+  const sent: Array<{ content: any; options?: any }> = [];
   const pi: PiLike = {
     on(event, handler) {
       handlers.set(event, handler);
@@ -26,11 +27,15 @@ function makeFakePi() {
     registerCommand(name, opts) {
       commands.set(name, opts);
     },
+    sendMessage(content, options) {
+      sent.push({ content, options });
+    },
   };
   return {
     pi,
     handlers,
     commands,
+    sent,
     fire(event: string, e: any, c: any = {}) {
       const h = handlers.get(event);
       assert.ok(h, `no handler registered for ${event}`);
@@ -113,6 +118,54 @@ describe("controller: message lifecycle", () => {
   });
 });
 
+describe("controller: steer → abort → bounded resume", () => {
+  it("first detection steers, second aborts with resume, third aborts for real", () => {
+    const c = createController();
+    const msg = (t: string) => [{ type: "text", text: t }];
+    const loop = "Let me fetch the merge ref:";
+    const fire = () => c.onMessageEnd("assistant", msg(loop));
+
+    fire();
+    fire();
+    const steer = fire();
+    assert.ok(steer, "third identical message must detect");
+    assert.equal(steer?.action, "steer", "first detection steers");
+    assert.equal(steer?.resume, false);
+    assert.match(steer?.reason ?? "", /near-identical text 3 times/);
+
+    const abort1 = fire();
+    assert.equal(abort1?.action, "abort");
+    assert.equal(abort1?.resume, true, "first abort queues a resume");
+
+    const abort2 = fire();
+    assert.equal(abort2?.action, "abort");
+    assert.equal(abort2?.resume, false, "resume budget spent");
+  });
+
+  it("reset clears the steer flag but keeps the resume budget (session-scoped)", () => {
+    const c = createController();
+    const msg = (t: string) => [{ type: "text", text: t }];
+    const loop = "Let me fetch the merge ref:";
+    const fire = () => c.onMessageEnd("assistant", msg(loop));
+
+    // consume the budget
+    fire();
+    fire();
+    fire(); // steer
+    fire(); // abort + resume (budget now spent)
+
+    c.reset(); // new user prompt — steer flag cleared, budget kept
+
+    fire();
+    fire();
+    const steerAgain = fire();
+    assert.equal(steerAgain?.action, "steer", "reset re-arms the steer flag");
+    const abortAgain = fire();
+    assert.equal(abortAgain?.action, "abort");
+    assert.equal(abortAgain?.resume, false, "budget not restored by reset");
+  });
+});
+
 describe("controller: reset", () => {
   it("clears streaks and blocked ids", () => {
     const c = createController();
@@ -182,28 +235,32 @@ describe("index.ts adapter (fake PiLike)", () => {
     assert.equal(aborts.length, 1, "escalation aborts the turn");
   });
 
-  it("wires message_end → abort on verbatim text loop", () => {
-    const { pi, fire } = makeFakePi();
+  it("wires message_end → steer first, then abort + bounded resume", () => {
+    const { pi, fire, sent } = makeFakePi();
     indexDefault(pi);
     const aborts: string[] = [];
     const ctx = { ...fakeCtx(), abort: () => aborts.push("abort") };
     const msg = (t: string) => [{ type: "text", text: t }];
-    fire(
-      "message_end",
-      { message: { role: "assistant", content: msg("Let me fetch the merge ref:") } },
-      ctx,
-    );
-    fire(
-      "message_end",
-      { message: { role: "assistant", content: msg("Let me fetch the merge ref:") } },
-      ctx,
-    );
-    fire(
-      "message_end",
-      { message: { role: "assistant", content: msg("Let me fetch the merge ref:") } },
-      ctx,
-    );
-    assert.equal(aborts.length, 1, "verbatim loop aborts exactly once");
+    const loop = "Let me fetch the merge ref:";
+    const fireMsg = () =>
+      fire("message_end", { message: { role: "assistant", content: msg(loop) } }, ctx);
+
+    fireMsg(); // streak 1 — nothing
+    fireMsg(); // streak 2 — nothing
+    fireMsg(); // streak 3 — STEER (no abort, agent continues)
+    assert.equal(aborts.length, 0, "first detection steers, does not abort");
+    assert.equal(sent.length, 1, "a steer message was sent");
+    assert.equal(sent[0].options?.deliverAs, "steer");
+    assert.equal(sent[0].options?.triggerTurn, true);
+
+    fireMsg(); // streak 4 — ABORT + resume
+    assert.equal(aborts.length, 1, "persistent loop aborts");
+    assert.equal(sent.length, 2, "a resume directive is queued after the abort");
+    assert.equal(sent[1].options?.deliverAs, "followUp");
+
+    fireMsg(); // streak 5 — abort for real (resume budget spent)
+    assert.equal(aborts.length, 2, "looping after resume aborts again");
+    assert.equal(sent.length, 2, "no second resume — budget is bounded");
   });
 
   it("resets counters on before_agent_start", () => {

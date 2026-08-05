@@ -4,6 +4,13 @@
  * `index.ts` is a thin adapter that wires these methods to pi's event loop;
  * tests drive this controller directly with plain objects. Same behavior,
  * no pi dependency (only `better-result` via the detector).
+ *
+ * Escalation ladder for message loops:
+ *   detection #1 → steer  (inject guidance, let the agent continue)
+ *   detection #2 → abort + resume (stop the run, queue one fresh directive)
+ *   detection #3+ → abort for real (hand back to the user)
+ * The resume budget is session-scoped: `reset()` (per user prompt) keeps it,
+ * a fresh session (new controller) starts over.
  */
 import { LoopDetector, readOptions } from "./detector.ts";
 import type { LoopOptions } from "./detector.ts";
@@ -39,14 +46,20 @@ export interface ToolCallOutcome {
 
 export interface TextLoopOutcome {
   reason: string;
+  action: "steer" | "abort";
+  /** When aborting: also queue a single fresh-resume directive (bounded). */
+  resume: boolean;
 }
+
+/** How many auto-resumes per session before we hand control back for real. */
+export const RESUME_BUDGET = 1;
 
 export interface AntiLoopController {
   /** Returns a block decision for a tool call, or null to let it run. */
   onToolCall(toolName: string, input: unknown, toolCallId: string): ToolCallOutcome | null;
   /** Record a finished tool result (blocked calls' results are ignored). */
   onToolResult(toolName: string, toolCallId: string, isError: boolean): void;
-  /** Detect verbatim assistant-text loops; returns an abort reason or null. */
+  /** Detect assistant-text loops; returns a steer/abort decision or null. */
   onMessageEnd(role: string, content: unknown): TextLoopOutcome | null;
   /** Full reset (session start, user prompt, /loopcheck reset). */
   reset(): void;
@@ -57,6 +70,8 @@ export interface AntiLoopController {
 export function createController(opts: LoopOptions = readOptions()): AntiLoopController {
   let detector = new LoopDetector(opts);
   const blockedIds = new Set<string>();
+  let steered = false;
+  let resumes = 0;
 
   return {
     onToolCall(toolName, input, toolCallId) {
@@ -85,12 +100,26 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       const text = extractText(content);
       if (!text) return null;
       const hit = detector.checkText(text);
-      return hit.isOk() ? { reason: hit.value.reason } : null;
+      if (!hit.isOk()) return null;
+
+      const reason = hit.value.reason;
+      if (!steered) {
+        steered = true;
+        return { reason, action: "steer", resume: false };
+      }
+      if (resumes < RESUME_BUDGET) {
+        resumes++;
+        return { reason, action: "abort", resume: true };
+      }
+      return { reason, action: "abort", resume: false };
     },
 
     reset() {
       detector = new LoopDetector(opts);
       blockedIds.clear();
+      steered = false;
+      // resumes is intentionally NOT reset here: the auto-resume budget is
+      // session-scoped so a stuck model cannot cycle steer→abort forever.
     },
 
     status() {

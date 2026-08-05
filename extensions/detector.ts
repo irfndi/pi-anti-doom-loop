@@ -147,26 +147,29 @@ export class LoopDetector {
     // `textRepeatThreshold`+ times inside ONE message (growing loops like
     // "…X:…X:…X"). Liquid.ai's loop definition — a section repeats at least N
     // times. No streak needed: the message itself is the loop.
-    if (!this.textFired) {
-      const chunk = repeatedSegment(norm, this.opts.textRepeatThreshold);
-      if (chunk !== null) {
-        this.textFired = true;
-        return Result.ok({
-          reason:
-            `Assistant message repeats "${truncate(chunk, 60)}" ${this.opts.textRepeatThreshold}+ times ` +
-            `within a single message. You appear to be in a loop — this run is aborted.`,
-        });
-      }
-    }
-
-    this.textStreak = norm === this.lastText ? this.textStreak + 1 : 1;
-    this.lastText = norm;
-    if (this.textStreak >= this.opts.textRepeatThreshold && !this.textFired) {
-      this.textFired = true;
+    const chunk = repeatedSegment(norm, this.opts.textRepeatThreshold);
+    if (chunk !== null) {
       return Result.ok({
         reason:
-          `Assistant replied with identical text ${this.textStreak} times in a row ("${truncate(norm, 80)}"). ` +
-          `You appear to be in a loop — this run is aborted.`,
+          `Assistant message repeats "${truncate(chunk, 60)}" ${this.opts.textRepeatThreshold}+ times ` +
+          `within a single message. You appear to be in a loop.`,
+      });
+    }
+
+    // Cross-message streak: consecutive assistant texts that are identical
+    // OR near-identical (token-overlap similarity). Catches loops where the
+    // model slightly rephrases each turn ("inspect the failing test" →
+    // "examine the failing assertion") so exact matching never fires.
+    const similar =
+      norm === this.lastText ||
+      (this.lastText !== null && tokenSimilarity(norm, this.lastText) >= TEXT_SIMILARITY_THRESHOLD);
+    this.textStreak = similar ? this.textStreak + 1 : 1;
+    this.lastText = norm;
+    if (this.textStreak >= this.opts.textRepeatThreshold) {
+      return Result.ok({
+        reason:
+          `Assistant replied with identical or near-identical text ${this.textStreak} times in a row ` +
+          `("${truncate(norm, 80)}"). You appear to be in a loop.`,
       });
     }
     return Result.err(undefined);
@@ -211,6 +214,31 @@ export function truncate(text: string, max: number): string {
 
 /** Minimum length of a segment worth treating as a repeated loop chunk. */
 export const MIN_REPEAT_CHUNK = 16;
+
+/** Jaccard similarity threshold for "near-identical" consecutive texts. */
+export const TEXT_SIMILARITY_THRESHOLD = 0.55;
+
+/**
+ * Token-set Jaccard similarity of two texts (case/whitespace-insensitive).
+ * Short tokens (< 3 chars: "a", "me", "to") are ignored to reduce noise.
+ * Returns 0..1; 1 = identical token sets.
+ */
+export function tokenSimilarity(a: string, b: string): number {
+  const tokenize = (s: string) => {
+    return new Set(
+      normalizeText(s)
+        .toLowerCase()
+        .split(/\s+/g)
+        .filter((w) => w.length >= 3 && /^[a-z0-9_-]+$/.test(w)),
+    );
+  };
+  const as = tokenize(a);
+  const bs = tokenize(b);
+  if (as.size === 0 || bs.size === 0) return 0;
+  let inter = 0;
+  for (const t of as) if (bs.has(t)) inter++;
+  return inter / (as.size + bs.size - inter);
+}
 
 /**
  * Returns the first sentence-ish segment that repeats `threshold` times
@@ -294,18 +322,22 @@ if (import.meta.main) {
   for (let i = 0; i < opts.windowSize; i++) d.record("bash", { command: `cmd ${i}` });
   assert.ok(d.check("bash", { command: "cmd 0" }).isErr(), "evicted repeats do not count");
 
-  // 7. verbatim assistant text loop: fires once at the 3rd identical message
+  // 7. verbatim assistant text loop: fires at the 3rd identical message and
+  //    every message after while the streak holds (controller escalates)
   d.reset();
   assert.ok(d.checkText("Now update buildProgram.").isErr(), "1st text passes");
   assert.ok(d.checkText("Now update buildProgram.").isErr(), "2nd text passes");
   const textHit = d.checkText("Now update buildProgram.");
   assert.ok(textHit.isOk(), "3rd identical text should fire");
   if (textHit.isOk()) {
-    assert.match(textHit.value.reason, /identical text 3 times/);
-    assert.match(textHit.value.reason, /aborted/);
+    assert.match(textHit.value.reason, /identical or near-identical text 3 times/);
   }
-  assert.ok(d.checkText("Now update buildProgram.").isErr(), "fires only once per run");
-
+  assert.ok(
+    d.checkText("Now update buildProgram.").isOk(),
+    "4th identical text still fires (escalation)",
+  );
+  d.reset();
+  assert.ok(d.checkText("Now update buildProgram.").isErr(), "reset clears the streak");
   // 8. whitespace drift does not hide a verbatim loop
   d.reset();
   d.checkText("Read the region:");

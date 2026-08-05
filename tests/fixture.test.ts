@@ -18,14 +18,18 @@ import {
 
 describe("fixtures: verbatim text loops (controller path)", () => {
   for (const fixture of [textLoop, textLoopBuildProgram]) {
-    it(`catches: ${fixture.name}`, () => {
+    it(`steers then aborts: ${fixture.name}`, () => {
       const c = createController();
+      let steered = false;
       let aborted = false;
       for (const message of fixture.messages) {
         const outcome = c.onMessageEnd("assistant", [{ type: "text", text: message }]);
-        if (outcome !== null) aborted = true;
+        if (outcome === null) continue;
+        if (outcome.action === "steer") steered = true;
+        else aborted = true;
       }
-      assert.ok(aborted, "the verbatim loop must trigger an abort");
+      assert.ok(steered, "the verbatim loop must steer first");
+      if (fixture.messages.length >= 4) assert.ok(aborted, "escalates to abort as it persists");
     });
   }
 });
@@ -47,14 +51,18 @@ describe("fixtures: identical tool calls (controller path)", () => {
 
 describe("fixtures: growing self-concatenation loops (within-message signal)", () => {
   for (const fixture of [growingTextLoop, growingTextLoopSpaced]) {
-    it(`catches: ${fixture.name}`, () => {
+    it(`steers then aborts: ${fixture.name}`, () => {
       const c = createController();
+      let steered = false;
       let aborted = false;
       for (const message of fixture.messages) {
         const outcome = c.onMessageEnd("assistant", [{ type: "text", text: message }]);
-        if (outcome !== null) aborted = true;
+        if (outcome === null) continue;
+        if (outcome.action === "steer") steered = true;
+        else aborted = true;
       }
-      assert.ok(aborted, "the growing self-concatenation loop must trigger an abort");
+      assert.ok(steered, "the growing self-concatenation loop must steer first");
+      if (fixture.messages.length >= 4) assert.ok(aborted, "escalates to abort as it persists");
     });
   }
 });

@@ -154,13 +154,47 @@ describe("fuzz: any stream with N identical calls must block", () => {
 });
 
 describe("fuzz: within-message self-repetition", () => {
-  it("random text never fires the within-message signal", () => {
+  it("random text never fires any signal", () => {
     const rand = rng(0xbeef0001);
     const d = new LoopDetector(opts);
+    const pool = [
+      "build",
+      "deploy",
+      "config",
+      "schema",
+      "module",
+      "client",
+      "server",
+      "worker",
+      "migration",
+      "endpoint",
+      "payload",
+      "handler",
+      "middleware",
+      "queue",
+      "worker",
+      "database",
+      "table",
+      "index",
+      "query",
+      "transaction",
+      "pipeline",
+      "artifact",
+      "version",
+      "release",
+      "package",
+      "binary",
+      "manifest",
+      "registry",
+      "gateway",
+    ];
     for (let i = 0; i < 300; i++) {
-      const len = Math.floor(rand() * 8);
-      let text = "";
-      for (let j = 0; j < len; j++) text += `random sentence number ${i}-${j}. `; // unique per position: no repeats possible
+      // Each message: 6 random DISTINCT words + a unique marker, so two
+      // consecutive messages share almost no tokens (similarity stays low)
+      // and no sentence repeats inside one message.
+      const words = new Set<string>();
+      while (words.size < 6) words.add(pool[Math.floor(rand() * pool.length)]);
+      const text = [...words].join(" ") + ` marker-${i}`;
       assert.ok(d.checkText(text).isErr(), `random text must not fire: ${text.slice(0, 60)}`);
     }
   });

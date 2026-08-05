@@ -11,6 +11,7 @@ import {
   normalizeText,
   truncate,
   repeatedSegment,
+  tokenSimilarity,
   readOptions,
   DEFAULT_OPTIONS,
   type LoopOptions,
@@ -98,17 +99,26 @@ describe("consecutive-failure detection", () => {
 });
 
 describe("verbatim text detection", () => {
-  it("fires once at the 3rd identical message, then stays silent until reset", () => {
+  it("fires at the 3rd identical message and every message after while the streak holds", () => {
     const d = new LoopDetector(opts);
     assert.ok(d.checkText("Let me fetch the merge ref:").isErr());
     assert.ok(d.checkText("Let me fetch the merge ref:").isErr());
     const hit = d.checkText("Let me fetch the merge ref:");
     assert.ok(hit.isOk());
     if (hit.isOk()) {
-      assert.match(hit.value.reason, /identical text 3 times/);
-      assert.match(hit.value.reason, /aborted/);
+      assert.match(hit.value.reason, /identical or near-identical text 3 times/);
     }
-    assert.ok(d.checkText("Let me fetch the merge ref:").isErr(), "fires only once per run");
+    // While the streak holds, every subsequent identical message also fires
+    assert.ok(
+      d.checkText("Let me fetch the merge ref:").isOk(),
+      "4th identical message still fires",
+    );
+    assert.ok(
+      d.checkText("Let me fetch the merge ref:").isOk(),
+      "5th identical message still fires",
+    );
+    d.reset();
+    assert.ok(d.checkText("Let me fetch the merge ref:").isErr(), "reset clears the streak");
   });
 
   it("whitespace drift does not hide a verbatim loop", () => {
@@ -197,15 +207,67 @@ describe("within-message detection through checkText", () => {
     assert.ok(hit.isOk(), "3 repeats inside one message: fire");
     if (hit.isOk()) {
       assert.match(hit.value.reason, /within a single message/);
-      assert.match(hit.value.reason, /aborted/);
     }
-    assert.ok(d.checkText((s + ":").repeat(4)).isErr(), "fires only once per run");
+    // While the condition holds, subsequent messages fire too (escalation).
+    assert.ok(d.checkText((s + ":").repeat(4)).isOk(), "4x-repeat message also fires");
   });
 
   it("fires even when the first message already contains the repetition", () => {
     const d = new LoopDetector(opts);
     const hit = d.checkText("Let me view the failing test context in the CI log:".repeat(3));
     assert.ok(hit.isOk(), "first message with 3 repeats fires immediately");
+  });
+});
+
+describe("near-identical text (tokenSimilarity)", () => {
+  it("returns high similarity for lightly rephrased sentences", () => {
+    const a = "Let me re-download the log and inspect the failing test";
+    const b = "Let me re-download the log and examine the failing assertion";
+    assert.ok(tokenSimilarity(a, b) >= 0.5, `similarity too low: ${tokenSimilarity(a, b)}`);
+    assert.equal(tokenSimilarity(a, a), 1);
+  });
+
+  it("returns low similarity for unrelated sentences", () => {
+    const s = tokenSimilarity(
+      "Open the file and read the tests",
+      "Deploy the service to production now",
+    );
+    assert.ok(s < 0.3, `expected low similarity, got ${s}`);
+  });
+
+  it("ignores short tokens and case", () => {
+    assert.equal(
+      tokenSimilarity("Go now!", "Go now!"),
+      0,
+      "tokens shorter than 3 chars are ignored",
+    );
+    assert.equal(tokenSimilarity("Read THE File", "read the file"), 1);
+  });
+
+  it("fires a streak on near-identical consecutive messages", () => {
+    const d = new LoopDetector(opts);
+    const variants = [
+      "Let me re-download the log and inspect the failing test",
+      "Let me re-download the log and examine the failing assertion",
+      "Let me re-download the run log and inspect the failing test's assertion",
+    ];
+    assert.ok(d.checkText(variants[0]).isErr());
+    assert.ok(d.checkText(variants[1]).isErr(), "2nd similar message: streak 2");
+    const hit = d.checkText(variants[2]);
+    assert.ok(hit.isOk(), "3rd similar message fires");
+    if (hit.isOk()) assert.match(hit.value.reason, /identical or near-identical text 3 times/);
+  });
+
+  it("a genuinely different message resets the similarity streak", () => {
+    const d = new LoopDetector(opts);
+    d.checkText("Let me re-download the log and inspect the failing test");
+    d.checkText("Let me re-download the log and examine the failing assertion");
+    d.checkText("The build passed and all tests are green now");
+    d.checkText("Let me re-download the log and inspect the failing test");
+    assert.ok(
+      d.checkText("Let me re-download the log and examine the failing assertion").isErr(),
+      "streak reset by the different message",
+    );
   });
 });
 
