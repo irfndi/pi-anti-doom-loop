@@ -11,6 +11,7 @@
  *     of a flaky/ungrounded operation).
  */
 import assert from "node:assert/strict";
+import { Result } from "better-result";
 
 export interface LoopOptions {
   /** Identical (tool, args) occurrences that trigger a block. */
@@ -85,13 +86,14 @@ export class LoopDetector {
     this.opts = opts;
   }
 
-  check(toolName: string, input: unknown): BlockDecision | null {
+  check(toolName: string, input: unknown): Result<BlockDecision, undefined> {
     const sig = signature(toolName, input);
     const repeats = this.recentSigs.filter((s) => s === sig).length;
     const total = repeats + 1; // including this call
     const fails = this.consecutiveFails(toolName);
 
-    if (total < this.opts.repeatThreshold && fails < this.opts.failThreshold) return null;
+    if (total < this.opts.repeatThreshold && fails < this.opts.failThreshold)
+      return Result.err(undefined);
 
     const reasons: string[] = [];
     if (total >= this.opts.repeatThreshold) {
@@ -106,12 +108,12 @@ export class LoopDetector {
     const blockedCount = (this.blockedBySig.get(sig) ?? 0) + 1;
     this.blockedBySig.set(sig, blockedCount);
 
-    return {
+    return Result.ok({
       reason:
         reasons.join("; ") +
         `. BLOCKED by anti-doom-loop — you appear to be looping. Change your approach, use a different tool, or ask the user.`,
       escalate: blockedCount > 1,
-    };
+    });
   }
 
   record(toolName: string, input: unknown): void {
@@ -135,20 +137,20 @@ export class LoopDetector {
    * least four times'; we use 3 and no length floor because at runtime each
    * repetition already burns tokens.
    */
-  checkText(text: string): { reason: string } | null {
+  checkText(text: string): Result<{ reason: string }, undefined> {
     const norm = normalizeText(text);
-    if (!norm) return null; // blank text is not a loop signal
+    if (!norm) return Result.err(undefined); // blank text is not a loop signal
     this.textStreak = norm === this.lastText ? this.textStreak + 1 : 1;
     this.lastText = norm;
     if (this.textStreak >= this.opts.textRepeatThreshold && !this.textFired) {
       this.textFired = true;
-      return {
+      return Result.ok({
         reason:
           `Assistant replied with identical text ${this.textStreak} times in a row ("${truncate(norm, 80)}"). ` +
           `You appear to be in a loop — this run is aborted.`,
-      };
+      });
     }
-    return null;
+    return Result.err(undefined);
   }
 
   /** Trail of results that are errors of this same tool (consecutive). */
@@ -199,27 +201,27 @@ if (import.meta.main) {
   const d: LoopDetector = new LoopDetector(opts);
 
   // 1. identical calls: 2 pass, 3rd is blocked; retry of a blocked call escalates
-  assert.equal(d.check("bash", { command: "grep foo bar.ts" }), null, "1st call passes");
+  assert.ok(d.check("bash", { command: "grep foo bar.ts" }).isErr(), "1st call passes");
   d.record("bash", { command: "grep foo bar.ts" });
-  assert.equal(d.check("bash", { command: "grep foo bar.ts" }), null, "2nd call passes");
+  assert.ok(d.check("bash", { command: "grep foo bar.ts" }).isErr(), "2nd call passes");
   d.record("bash", { command: "grep foo bar.ts" });
-  const hit: BlockDecision | null = d.check("bash", { command: "grep foo bar.ts" });
-  assert.ok(hit, "3rd identical call should block");
-  if (hit) {
-    assert.equal(hit.escalate, false, "first block does not escalate");
-    assert.match(hit.reason, /identical arguments 3 times/);
+  const hit = d.check("bash", { command: "grep foo bar.ts" });
+  assert.ok(hit.isOk(), "3rd identical call should block");
+  if (hit.isOk()) {
+    assert.equal(hit.value.escalate, false, "first block does not escalate");
+    assert.match(hit.value.reason, /identical arguments 3 times/);
   }
   // LLM ignores the block and retries the exact same call: escalate
-  const hit2: BlockDecision | null = d.check("bash", { command: "grep foo bar.ts" });
-  assert.ok(hit2 && hit2.escalate, "retry of a blocked call should escalate");
+  const hit2 = d.check("bash", { command: "grep foo bar.ts" });
+  assert.ok(hit2.isOk() && hit2.value.escalate, "retry of a blocked call should escalate");
 
   // 2. different arguments are not a loop
   d.reset();
-  assert.equal(d.check("read", { path: "a.ts" }), null);
+  assert.ok(d.check("read", { path: "a.ts" }).isErr());
   d.record("read", { path: "a.ts" });
-  assert.equal(d.check("read", { path: "b.ts" }), null);
+  assert.ok(d.check("read", { path: "b.ts" }).isErr());
   d.record("read", { path: "b.ts" });
-  assert.equal(d.check("read", { path: "a.ts" }), null, "arg order/counter: only same args count");
+  assert.ok(d.check("read", { path: "a.ts" }).isErr(), "arg order/counter: only same args count");
 
   // 3. key order does not matter
   assert.equal(signature("read", { a: 1, b: 2 }), signature("read", { b: 2, a: 1 }));
@@ -229,9 +231,9 @@ if (import.meta.main) {
   d.recordResult("bash", true);
   d.recordResult("bash", true);
   d.recordResult("bash", true);
-  const failHit: BlockDecision | null = d.check("bash", { command: "npm test" });
-  assert.ok(failHit, "3 consecutive failures should block");
-  if (failHit) assert.match(failHit.reason, /failed 3 consecutive times/);
+  const failHit = d.check("bash", { command: "npm test" });
+  assert.ok(failHit.isOk(), "3 consecutive failures should block");
+  if (failHit.isOk()) assert.match(failHit.value.reason, /failed 3 consecutive times/);
 
   // 5. an interleaved success breaks the failure streak
   d.reset();
@@ -239,31 +241,31 @@ if (import.meta.main) {
   d.recordResult("bash", false);
   d.recordResult("bash", true);
   d.recordResult("bash", true);
-  assert.equal(d.check("bash", { command: "npm test" }), null, "success breaks the streak");
+  assert.ok(d.check("bash", { command: "npm test" }).isErr(), "success breaks the streak");
 
   // 6. window eviction: stale repeats no longer count
   d.reset();
   for (let i = 0; i < opts.windowSize; i++) d.record("bash", { command: `cmd ${i}` });
-  assert.equal(d.check("bash", { command: "cmd 0" }), null, "evicted repeats do not count");
+  assert.ok(d.check("bash", { command: "cmd 0" }).isErr(), "evicted repeats do not count");
 
   // 7. verbatim assistant text loop: fires once at the 3rd identical message
   d.reset();
-  assert.equal(d.checkText("Now update buildProgram."), null, "1st text passes");
-  assert.equal(d.checkText("Now update buildProgram."), null, "2nd text passes");
+  assert.ok(d.checkText("Now update buildProgram.").isErr(), "1st text passes");
+  assert.ok(d.checkText("Now update buildProgram.").isErr(), "2nd text passes");
   const textHit = d.checkText("Now update buildProgram.");
-  assert.ok(textHit, "3rd identical text should fire");
-  if (textHit) {
-    assert.match(textHit.reason, /identical text 3 times/);
-    assert.match(textHit.reason, /aborted/);
+  assert.ok(textHit.isOk(), "3rd identical text should fire");
+  if (textHit.isOk()) {
+    assert.match(textHit.value.reason, /identical text 3 times/);
+    assert.match(textHit.value.reason, /aborted/);
   }
-  assert.equal(d.checkText("Now update buildProgram."), null, "fires only once per run");
+  assert.ok(d.checkText("Now update buildProgram.").isErr(), "fires only once per run");
 
   // 8. whitespace drift does not hide a verbatim loop
   d.reset();
   d.checkText("Read the region:");
   d.checkText("Read  the   region:");
   const wsHit = d.checkText(" Read the region: ");
-  assert.ok(wsHit, "whitespace-normalized repeats should fire");
+  assert.ok(wsHit.isOk(), "whitespace-normalized repeats should fire");
 
   // 9. a different message breaks the streak (need 3 consecutive AFTER the break to fire)
   d.reset();
@@ -271,15 +273,14 @@ if (import.meta.main) {
   d.checkText("A");
   d.checkText("B"); // breaks the streak
   d.checkText("A");
-  assert.equal(d.checkText("A"), null, "only 2 consecutive As after the break must not fire");
+  assert.ok(d.checkText("A").isErr(), "only 2 consecutive As after the break must not fire");
   const again = d.checkText("A");
-  assert.ok(again, "3 consecutive As after the break fire");
+  assert.ok(again.isOk(), "3 consecutive As after the break fire");
 
   // 10. empty/blank text is ignored as a loop signal
   d.reset();
   d.checkText("");
   d.checkText("   ");
-  assert.equal(d.checkText(""), null, "blank text must not fire");
-
+  assert.ok(d.checkText("").isErr(), "blank text must not fire");
   console.log("detector self-check: all assertions passed");
 }

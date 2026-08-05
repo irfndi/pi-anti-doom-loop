@@ -32,7 +32,7 @@ jobs:
         run: npm ci && npm run check
 
       - name: Version bump guard
-        run: node scripts/guard-publish.mjs "$EXPECTED"
+        run: node scripts/guard-publish.ts "$EXPECTED"
         env:
           EXPECTED: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
 

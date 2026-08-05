@@ -33,16 +33,17 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("tool_call", (event, ctx) => {
     const decision = detector.check(event.toolName, event.input);
-    if (decision === null) {
+    if (decision.isErr()) {
       detector.record(event.toolName, event.input);
       return;
     }
+    const block = decision.value;
     blockedIds.add(event.toolCallId);
-    if (decision.escalate) {
+    if (block.escalate) {
       ctx.ui.notify("Anti-doom-loop: identical call blocked again — aborting turn", "error");
       ctx.abort();
     }
-    return { block: true, reason: decision.reason };
+    return { block: true, reason: block.reason };
   });
 
   // Blocked calls never ran, so their (error) result must not count as a failure.
@@ -66,8 +67,8 @@ export default function (pi: ExtensionAPI): void {
       .join(" ");
     if (!text) return;
     const hit = detector.checkText(text);
-    if (hit) {
-      ctx.ui.notify(`Anti-doom-loop: ${hit.reason}`, "error");
+    if (hit.isOk()) {
+      ctx.ui.notify(`Anti-doom-loop: ${hit.value.reason}`, "error");
       ctx.abort();
     }
   });

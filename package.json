@@ -30,10 +30,14 @@
   "scripts": {
     "check": "npm run test && tsc --noEmit && oxlint && oxfmt --check .",
     "test": "node extensions/detector.ts",
-    "guard": "node scripts/guard-publish.mjs",
+    "guard": "node scripts/guard-publish.ts",
     "lint": "oxlint",
     "format": "oxfmt .",
     "format:check": "oxfmt --check ."
+  },
+  "dependencies": {
+    "better-result": "^3.0.0",
+    "effect": "^4.0.0-beta.103"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",
