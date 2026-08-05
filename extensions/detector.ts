@@ -19,12 +19,15 @@ export interface LoopOptions {
   failThreshold: number;
   /** How many recent calls/results are inspected for repetition. */
   windowSize: number;
+  /** Consecutive verbatim assistant messages that trigger an abort. */
+  textRepeatThreshold: number;
 }
 
 export const DEFAULT_OPTIONS: LoopOptions = {
   repeatThreshold: 3,
   failThreshold: 3,
   windowSize: 10,
+  textRepeatThreshold: 3,
 };
 
 export function readOptions(env: Record<string, string | undefined> = process.env): LoopOptions {
@@ -38,6 +41,7 @@ export function readOptions(env: Record<string, string | undefined> = process.en
     repeatThreshold: num("PI_ANTI_LOOP_REPEATS", DEFAULT_OPTIONS.repeatThreshold),
     failThreshold: num("PI_ANTI_LOOP_FAILS", DEFAULT_OPTIONS.failThreshold),
     windowSize: num("PI_ANTI_LOOP_WINDOW", DEFAULT_OPTIONS.windowSize),
+    textRepeatThreshold: num("PI_ANTI_LOOP_TEXT_REPEATS", DEFAULT_OPTIONS.textRepeatThreshold),
   };
 }
 
@@ -73,6 +77,9 @@ export class LoopDetector {
   private recentSigs: string[] = [];
   private recentResults: { tool: string; error: boolean }[] = [];
   private blockedBySig = new Map<string, number>();
+  private lastText: string | null = null;
+  private textStreak = 0;
+  private textFired = false;
 
   constructor(opts: LoopOptions = DEFAULT_OPTIONS) {
     this.opts = opts;
@@ -117,6 +124,33 @@ export class LoopDetector {
     if (this.recentResults.length > this.opts.windowSize) this.recentResults.shift();
   }
 
+  /**
+   * Consecutive verbatim assistant text (whitespace-normalized). Fires once
+   * per run when the streak reaches textRepeatThreshold, then stays silent
+   * until reset — message_end cannot return a block, so the caller aborts.
+   * $
+   * Detects the text-only loop shape (model re-emits the same sentence
+   * forever, e.g. goal-function loops) that identical-tool-call detection
+   * never sees. Liquid.ai's Antidoom mines loops as 'a section repeats at
+   * least four times'; we use 3 and no length floor because at runtime each
+   * repetition already burns tokens.
+   */
+  checkText(text: string): { reason: string } | null {
+    const norm = normalizeText(text);
+    if (!norm) return null; // blank text is not a loop signal
+    this.textStreak = norm === this.lastText ? this.textStreak + 1 : 1;
+    this.lastText = norm;
+    if (this.textStreak >= this.opts.textRepeatThreshold && !this.textFired) {
+      this.textFired = true;
+      return {
+        reason:
+          `Assistant replied with identical text ${this.textStreak} times in a row ("${truncate(norm, 80)}"). ` +
+          `You appear to be in a loop — this run is aborted.`,
+      };
+    }
+    return null;
+  }
+
   /** Trail of results that are errors of this same tool (consecutive). */
   private consecutiveFails(toolName: string): number {
     let n = 0;
@@ -132,17 +166,36 @@ export class LoopDetector {
     this.recentSigs = [];
     this.recentResults = [];
     this.blockedBySig.clear();
+    this.lastText = null;
+    this.textStreak = 0;
+    this.textFired = false;
   }
 
   summary(): string {
     const blocked = [...this.blockedBySig.values()].reduce((a, b) => a + b, 0);
-    return `window: ${this.recentSigs.length}/${this.opts.windowSize} calls, ${this.recentResults.length} results, blocked ${blocked} time(s)`;
+    const text = this.textStreak > 1 ? `, text streak ${this.textStreak}` : "";
+    return `window: ${this.recentSigs.length}/${this.opts.windowSize} calls, ${this.recentResults.length} results, blocked ${blocked} time(s)${text}`;
   }
+}
+
+/** Collapse runs of whitespace so formatting drift never hides a verbatim loop. */
+export function normalizeText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+/** First `max` chars of a single-line string, with an ellipsis. */
+export function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
 // --- self-check (runs under `node extensions/detector.ts`, skipped when loaded by pi) ---
 if (import.meta.main) {
-  const opts: LoopOptions = { repeatThreshold: 3, failThreshold: 3, windowSize: 10 };
+  const opts: LoopOptions = {
+    repeatThreshold: 3,
+    failThreshold: 3,
+    windowSize: 10,
+    textRepeatThreshold: 3,
+  };
   const d: LoopDetector = new LoopDetector(opts);
 
   // 1. identical calls: 2 pass, 3rd is blocked; retry of a blocked call escalates
@@ -192,6 +245,41 @@ if (import.meta.main) {
   d.reset();
   for (let i = 0; i < opts.windowSize; i++) d.record("bash", { command: `cmd ${i}` });
   assert.equal(d.check("bash", { command: "cmd 0" }), null, "evicted repeats do not count");
+
+  // 7. verbatim assistant text loop: fires once at the 3rd identical message
+  d.reset();
+  assert.equal(d.checkText("Now update buildProgram."), null, "1st text passes");
+  assert.equal(d.checkText("Now update buildProgram."), null, "2nd text passes");
+  const textHit = d.checkText("Now update buildProgram.");
+  assert.ok(textHit, "3rd identical text should fire");
+  if (textHit) {
+    assert.match(textHit.reason, /identical text 3 times/);
+    assert.match(textHit.reason, /aborted/);
+  }
+  assert.equal(d.checkText("Now update buildProgram."), null, "fires only once per run");
+
+  // 8. whitespace drift does not hide a verbatim loop
+  d.reset();
+  d.checkText("Read the region:");
+  d.checkText("Read  the   region:");
+  const wsHit = d.checkText(" Read the region: ");
+  assert.ok(wsHit, "whitespace-normalized repeats should fire");
+
+  // 9. a different message breaks the streak (need 3 consecutive AFTER the break to fire)
+  d.reset();
+  d.checkText("A");
+  d.checkText("A");
+  d.checkText("B"); // breaks the streak
+  d.checkText("A");
+  assert.equal(d.checkText("A"), null, "only 2 consecutive As after the break must not fire");
+  const again = d.checkText("A");
+  assert.ok(again, "3 consecutive As after the break fire");
+
+  // 10. empty/blank text is ignored as a loop signal
+  d.reset();
+  d.checkText("");
+  d.checkText("   ");
+  assert.equal(d.checkText(""), null, "blank text must not fire");
 
   console.log("detector self-check: all assertions passed");
 }

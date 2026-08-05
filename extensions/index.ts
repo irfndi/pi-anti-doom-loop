@@ -54,6 +54,24 @@ export default function (pi: ExtensionAPI): void {
     detector.recordResult(event.toolName, event.isError === true);
   });
 
+  // Text-only doom loops (model re-emits the same sentence with no tool calls)
+  // never reach tool_call. Detect verbatim assistant repeats and abort the run.
+  pi.on("message_end", (event, ctx) => {
+    const message = event.message;
+    if (message.role !== "assistant") return;
+    const content = Array.isArray(message.content) ? message.content : [];
+    const text = content
+      .filter((c): c is { type: "text"; text: string } => c.type === "text")
+      .map((c) => c.text)
+      .join(" ");
+    if (!text) return;
+    const hit = detector.checkText(text);
+    if (hit) {
+      ctx.ui.notify(`Anti-doom-loop: ${hit.reason}`, "error");
+      ctx.abort();
+    }
+  });
+
   pi.registerCommand("loopcheck", {
     description: "Anti-doom-loop status; `/loopcheck reset` clears counters",
     handler: async (args, ctx) => {
