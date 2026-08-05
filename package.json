@@ -17,7 +17,8 @@
   },
   "files": [
     "extensions",
-    "scripts"
+    "scripts",
+    "CHANGELOG.md"
   ],
   "type": "module",
   "main": "extensions/index.ts",
