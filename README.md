@@ -61,10 +61,20 @@ Requires Node 22.6+ (plain `node` runs the TS self-check).
 ```bash
 npm install
 npm test        # detector self-check (pure Node, no deps)
-npm run check   # npm test + tsc + oxlint + oxfmt
+npm run check   # npm test + tsc + oxlint --deny-warnings + oxfmt
 ```
 
 Runtime deps: `better-result` (detector decisions) and `effect` v4 (the release guard).
+
+> `peerDependencies` pins `@earendil-works/pi-coding-agent` at `"*"` on purpose — the
+> [pi packages docs](https://pi.dev/docs/latest/packages) require an unbounded range for
+> pi-core packages (pi provides them at runtime). The extension loads `.ts` directly via
+> jiti, so no build step ships; `prepublishOnly` runs the full quality gate before publish.
+
+> When a call is blocked, escalation still works without recording it in the window:
+> re-issuing the identical call increments a per-signature block counter and aborts the
+> turn on the second block. Thresholds are clamped to a minimum of 2 so a bad config
+> can never brick the agent.
 
 ## Releasing
 

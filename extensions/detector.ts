@@ -32,11 +32,13 @@ export const DEFAULT_OPTIONS: LoopOptions = {
 };
 
 export function readOptions(env: Record<string, string | undefined> = process.env): LoopOptions {
+  // ponytail: min 2 — a threshold of 1 would block every tool call / abort on
+  // the first message, bricking the agent (deepsec finding).
   const num = (key: string, fallback: number): number => {
     const raw = env[key];
     if (!raw) return fallback;
     const n = Number(raw);
-    return Number.isFinite(n) && n > 0 ? n : fallback;
+    return Number.isFinite(n) && n >= 2 ? n : fallback;
   };
   return {
     repeatThreshold: num("PI_ANTI_LOOP_REPEATS", DEFAULT_OPTIONS.repeatThreshold),
@@ -282,5 +284,18 @@ if (import.meta.main) {
   d.checkText("");
   d.checkText("   ");
   assert.ok(d.checkText("").isErr(), "blank text must not fire");
+
+  // 11. threshold 1 is clamped away (would brick the agent)
+  const clamped = readOptions({
+    PI_ANTI_LOOP_REPEATS: "1",
+    PI_ANTI_LOOP_FAILS: "0",
+    PI_ANTI_LOOP_TEXT_REPEATS: "-2",
+  });
+  assert.equal(clamped.repeatThreshold, 3, "1 falls back to default");
+  assert.equal(clamped.failThreshold, 3, "0 falls back to default");
+  assert.equal(clamped.textRepeatThreshold, 3, "negative falls back to default");
+  const two = readOptions({ PI_ANTI_LOOP_REPEATS: "2" });
+  assert.equal(two.repeatThreshold, 2, "2 is the minimum accepted");
+
   console.log("detector self-check: all assertions passed");
 }

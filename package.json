@@ -16,7 +16,8 @@
     "url": "git+https://github.com/irfndi/pi-anti-doom-loop.git"
   },
   "files": [
-    "extensions"
+    "extensions",
+    "scripts"
   ],
   "type": "module",
   "main": "extensions/index.ts",
@@ -28,10 +29,11 @@
     "access": "public"
   },
   "scripts": {
-    "check": "npm run test && tsc --noEmit && oxlint && oxfmt --check .",
+    "check": "npm run test && tsc --noEmit && oxlint --deny-warnings && oxfmt --check .",
+    "prepublishOnly": "npm run check",
     "test": "node extensions/detector.ts",
     "guard": "node scripts/guard-publish.ts",
-    "lint": "oxlint",
+    "lint": "oxlint --deny-warnings",
     "format": "oxfmt .",
     "format:check": "oxfmt --check ."
   },
@@ -50,7 +52,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "engines": {
-    "node": ">=22.6"
+    "node": ">=22.18"
   },
   "pi": {
     "extensions": [
