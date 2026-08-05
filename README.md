@@ -60,11 +60,19 @@ Requires Node 22.6+ (plain `node` runs the TS self-check).
 
 ```bash
 npm install
-npm test        # detector self-check (pure Node, no deps)
+npm test        # node --test: unit + fixture + fuzz + integration + e2e
 npm run check   # npm test + tsc + oxlint --deny-warnings + oxfmt
 ```
 
-Runtime deps: `better-result` (detector decisions) and `effect` v4 (the release guard).
+### Test suite (Node built-in runner, no framework)
+
+| Suite       | File                                          | What it proves                                                                                                    |
+| ----------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| unit        | `tests/unit.test.ts`                          | detector semantics: repeat/failure/text signals, window eviction, options clamping, helpers                       |
+| fixture     | `tests/fixtures.ts` + `tests/fixture.test.ts` | real doom-loop transcripts (CI-log loops, verbatim repeats) are caught; healthy sessions are not                  |
+| fuzz        | `tests/fuzz.test.ts`                          | seeded random streams: never throws, no false positives, injected loops always block, canonical stability         |
+| integration | `tests/integration.test.ts`                   | controller + `index.ts` adapter driven through a fake `PiLike`: blocks, escalations, aborts, resets, `/loopcheck` |
+| e2e         | `tests/e2e.test.ts`                           | real subprocesses: detector self-check, version guard, tarball contents (extensions/scripts ship, tests don't)    |
 
 > `peerDependencies` pins `@earendil-works/pi-coding-agent` at `"*"` on purpose — the
 > [pi packages docs](https://pi.dev/docs/latest/packages) require an unbounded range for
