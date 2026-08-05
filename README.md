@@ -60,7 +60,8 @@ Requires Node 22.6+ (plain `node` runs the TS self-check).
 
 ```bash
 npm install
-npm run check   # detector self-check + tsc + oxlint + oxfmt
+npm test        # detector self-check (pure Node, no deps)
+npm run check   # npm test + tsc + oxlint + oxfmt
 ```
 
 ## Releasing

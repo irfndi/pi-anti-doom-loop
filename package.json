@@ -27,8 +27,12 @@
   "publishConfig": {
     "access": "public"
   },
+  "engines": {
+    "node": ">=22.6"
+  },
   "scripts": {
-    "check": "node extensions/detector.ts && tsc --noEmit && oxlint && oxfmt --check .",
+    "check": "npm run test && tsc --noEmit && oxlint && oxfmt --check .",
+    "test": "node extensions/detector.ts",
     "guard": "node scripts/guard-publish.mjs",
     "lint": "oxlint",
     "format": "oxfmt .",
