@@ -63,7 +63,8 @@ const tagExists = (version: string): Effect.Effect<boolean> =>
         return false; // no git repo / git missing → treat as no tag
       }
     },
-    catch: () => false,
+    catch: () => new Error("git tag check failed"),
+  }).pipe(Effect.catch(() => Effect.succeed(false)));
   });
 /**
  * Latest published version on npm, or null when the package was never
