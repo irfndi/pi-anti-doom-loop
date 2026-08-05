@@ -47,6 +47,25 @@ const parseManifest = (raw: string): Effect.Effect<Manifest, GuardError> => {
 const semverLike = (value: string): boolean => /^\d+\.\d+\.\d+$/.test(value);
 
 /**
+ * Whether a git tag `v<version>` exists in the current checkout. On the
+ * manual-dispatch path no tag is pushed, so this closes the tag/sync gap.
+ */
+const tagExists = (version: string): Effect.Effect<boolean> =>
+  Effect.tryPromise({
+    try: async () => {
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const run = promisify(execFile);
+      try {
+        const { stdout } = await run("git", ["tag", "-l", `v${version}`], { cwd: process.cwd() });
+        return stdout.trim().length > 0;
+      } catch {
+        return false; // no git repo / git missing → treat as no tag
+      }
+    },
+    catch: () => false,
+  });
+/**
  * Latest published version on npm, or null when the package was never
  * published or the registry is unreachable (warn-only on network failure —
  * `npm publish` remains the real gate).
@@ -89,6 +108,15 @@ const program: Effect.Effect<string, GuardError> = Effect.gen(function* () {
     yield* fail(
       `GUARD FAIL: ${pkg.name}@${local} is already published on npm. ` +
         `Bump the version in package.json to cut a new release.`,
+    );
+  }
+
+  // On the manual-dispatch path no tag is pushed, so require the version to
+  // exist as a git tag — keeps the tag/manifest-sync invariant on both entry
+  // points (clawpatch finding).
+  if (expected && (yield* tagExists(expected)) === false) {
+    yield* fail(
+      `GUARD FAIL: expected version "${expected}" has no matching git tag v${expected}. Tag it first.`,
     );
   }
 

@@ -16,12 +16,19 @@ on:
 permissions:
   contents: read
 
+# One release at a time: a tag push racing a manual dispatch must not both
+# pass the guard and race npm publish (check-then-act TOCTOU window).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
+        with:
+          fetch-depth: 0 # tags visible to the version guard
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -37,6 +44,8 @@ jobs:
           EXPECTED: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
 
       - name: Publish to npm
-        run: npm publish
+        run: |
+          npm publish --dry-run
+          npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
