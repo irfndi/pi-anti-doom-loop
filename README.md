@@ -65,6 +65,7 @@ npm run check   # npm test + tsc + oxlint + oxfmt
 ```
 
 Runtime deps: `better-result` (detector decisions) and `effect` v4 (the release guard).
+
 ## Releasing
 
 Publishing is handled by the GitHub Actions workflow [`.github/workflows/release.yml`](.github/workflows/release.yml), guarded against version drift:
