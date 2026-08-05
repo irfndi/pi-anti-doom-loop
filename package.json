@@ -1,0 +1,52 @@
+{
+  "name": "pi-anti-doom-loop",
+  "version": "0.0.1",
+  "description": "Detect and break agent doom loops in pi: blocks identical repeated tool calls and blind retries before they burn tokens.",
+  "keywords": [
+    "anti-doom-loop",
+    "loop-detection",
+    "pi-extension",
+    "pi-package"
+  ],
+  "homepage": "https://github.com/irfndi/pi-anti-doom-loop",
+  "license": "MIT",
+  "author": "irfandi <join.mantap@gmail.com> (https://github.com/irfndi)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/irfndi/pi-anti-doom-loop.git"
+  },
+  "files": [
+    "extensions"
+  ],
+  "type": "module",
+  "main": "extensions/index.ts",
+  "types": "extensions/index.ts",
+  "exports": {
+    ".": "./extensions/index.ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "node extensions/detector.ts && tsc --noEmit && oxlint && oxfmt --check .",
+    "guard": "node scripts/guard-publish.mjs",
+    "lint": "oxlint",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check ."
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^22.0.0",
+    "oxfmt": "^0.62.0",
+    "oxlint": "^1.77.0",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}

@@ -1,0 +1,42 @@
+name: Release
+
+# Cut a release: bump version in package.json, push tag vX.Y.Z.
+# The version bump guard blocks publishing an already-published version and
+# verifies the tag matches package.json, so tags and manifests stay in sync.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Expected version (vX.Y.Z) — must match package.json. Leave empty on tag pushes."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Quality gate (self-check, typecheck, lint, format)
+        run: npm ci && npm run check
+
+      - name: Version bump guard
+        run: node scripts/guard-publish.mjs "$EXPECTED"
+        env:
+          EXPECTED: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+
+      - name: Publish to npm
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
