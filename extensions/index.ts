@@ -73,7 +73,8 @@ export default function (pi: PiLike): void {
   pi.on("session_start", () => reset());
 
   // Fresh counters per user prompt: only the loop happening *right now* counts.
-  pi.on("before_agent_start", () => reset());
+  // Internal reset keeps session-scoped steers/aborts/resume budget.
+  pi.on("before_agent_start", () => controller.reset());
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
     const outcome = controller.onToolCall(event.toolName, event.input, event.toolCallId);
@@ -118,9 +119,20 @@ export default function (pi: PiLike): void {
   pi.registerCommand("loopcheck", {
     description: "Anti-doom-loop status; `/loopcheck reset` clears counters",
     handler: async (args: string, ctx: CommandCtxLite) => {
-      if (args.trim().toLowerCase() === "reset") {
+      const arg = args.trim().toLowerCase();
+      if (arg === "reset") {
         reset();
         ctx.ui.notify("Anti-doom-loop: counters reset", "info");
+        return;
+      }
+      if (arg === "suspend") {
+        controller.suspend();
+        ctx.ui.notify("Anti-doom-loop: suspended until the next prompt", "info");
+        return;
+      }
+      if (arg === "resume") {
+        controller.resume();
+        ctx.ui.notify("Anti-doom-loop: resumed", "info");
         return;
       }
       ctx.ui.notify(controller.status(), "info");

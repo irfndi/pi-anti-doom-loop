@@ -11,6 +11,7 @@ import {
   textLoopBuildProgram,
   growingTextLoop,
   growingTextLoopSpaced,
+  regexRepeatLoop,
   toolLoopGhRunView,
   toolLoopGrepSameFile,
   healthySession,
@@ -50,7 +51,7 @@ describe("fixtures: identical tool calls (controller path)", () => {
 });
 
 describe("fixtures: growing self-concatenation loops (within-message signal)", () => {
-  for (const fixture of [growingTextLoop, growingTextLoopSpaced]) {
+  for (const fixture of [growingTextLoop, growingTextLoopSpaced, regexRepeatLoop]) {
     it(`steers then aborts: ${fixture.name}`, () => {
       const c = createController();
       let steered = false;

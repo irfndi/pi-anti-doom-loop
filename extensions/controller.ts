@@ -63,6 +63,10 @@ export interface AntiLoopController {
   onMessageEnd(role: string, content: unknown): TextLoopOutcome | null;
   /** Full reset (session start, user prompt, /loopcheck reset). */
   reset(): void;
+  /** Suspend detection until the next reset (escape hatch for intentional repetition). */
+  suspend(): void;
+  resume(): void;
+  isSuspended(): boolean;
   /** Human-readable status with thresholds + counters for /loopcheck. */
   status(): string;
 }
@@ -72,9 +76,13 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
   const blockedIds = new Set<string>();
   let steered = false;
   let resumes = 0;
+  let steers = 0;
+  let aborts = 0;
+  let suspended = false;
 
   return {
     onToolCall(toolName, input, toolCallId) {
+      if (suspended) return null;
       const decision = detector.check(toolName, input);
       if (decision.isErr()) {
         detector.record(toolName, input);
@@ -96,6 +104,7 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
     },
 
     onMessageEnd(role, content) {
+      if (suspended) return null;
       if (role !== "assistant") return null;
       const text = extractText(content);
       if (!text) return null;
@@ -105,12 +114,15 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       const reason = hit.value.reason;
       if (!steered) {
         steered = true;
+        steers++;
         return { reason, action: "steer", resume: false };
       }
       if (resumes < RESUME_BUDGET) {
         resumes++;
+        aborts++;
         return { reason, action: "abort", resume: true };
       }
+      aborts++;
       return { reason, action: "abort", resume: false };
     },
 
@@ -118,15 +130,31 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       detector = new LoopDetector(opts);
       blockedIds.clear();
       steered = false;
-      // resumes is intentionally NOT reset here: the auto-resume budget is
-      // session-scoped so a stuck model cannot cycle steer→abort forever.
+      suspended = false;
+      // resumes/steers/aborts are intentionally NOT reset here: they are
+      // session-scoped so a stuck model cannot cycle steer→abort forever and
+      // /loopcheck can report lifetime counters.
+    },
+
+    suspend() {
+      suspended = true;
+    },
+
+    resume() {
+      suspended = false;
+    },
+
+    isSuspended() {
+      return suspended;
     },
 
     status() {
       const o = detector.opts;
+      const s = suspended ? ", suspended" : "";
       return (
         `anti-doom-loop: repeats>=${o.repeatThreshold}/window ${o.windowSize}, ` +
-        `fails>=${o.failThreshold}, text>=${o.textRepeatThreshold}. ${detector.summary()}`
+        `fails>=${o.failThreshold}, text>=${o.textRepeatThreshold}. ${detector.summary()} ` +
+        `steers=${steers} aborts=${aborts}${s}`
       );
     },
   };

@@ -166,6 +166,55 @@ describe("controller: steer → abort → bounded resume", () => {
   });
 });
 
+describe("controller: counters + suspend", () => {
+  it("status reports steers and aborts for the session", () => {
+    const c = createController();
+    const msg = (t: string) => [{ type: "text", text: t }];
+    const loop = "Let me fetch the merge ref:";
+    const fire = () => c.onMessageEnd("assistant", msg(loop));
+    fire();
+    fire();
+    fire(); // steer
+    fire(); // abort
+    fire(); // abort
+    const s = c.status();
+    assert.match(s, /steers=1/);
+    assert.match(s, /aborts=2/);
+  });
+
+  it("suspend disables detection until reset", () => {
+    const c = createController();
+    const msg = (t: string) => [{ type: "text", text: t }];
+    const loop = "Let me fetch the merge ref:";
+    // build a streak so detection would fire
+    c.onMessageEnd("assistant", msg(loop));
+    c.onMessageEnd("assistant", msg(loop));
+    c.onMessageEnd("assistant", msg(loop)); // steer
+    c.onMessageEnd("assistant", msg(loop)); // abort
+
+    c.suspend();
+    assert.ok(c.isSuspended());
+    assert.match(c.status(), /suspended/);
+    assert.equal(c.onMessageEnd("assistant", msg(loop)), null, "suspended: no detection");
+    assert.equal(
+      c.onToolCall("bash", { command: "grep foo" }, "c1"),
+      null,
+      "suspended: no tool blocking",
+    );
+
+    c.resume();
+    assert.ok(!c.isSuspended());
+    // streak persists after resume — next message still detects
+    const hit = c.onMessageEnd("assistant", msg(loop));
+    assert.ok(hit !== null, "resumed: detection active again");
+
+    c.reset(); // next prompt clears suspend
+    c.suspend();
+    c.reset();
+    assert.ok(!c.isSuspended(), "reset clears the suspend flag");
+  });
+});
+
 describe("controller: reset", () => {
   it("clears streaks and blocked ids", () => {
     const c = createController();
@@ -278,7 +327,7 @@ describe("index.ts adapter (fake PiLike)", () => {
     assert.equal(r, undefined, "after reset the same call passes again");
   });
 
-  it("registers the /loopcheck command with status and reset", async () => {
+  it("registers the /loopcheck command with status, reset, suspend, resume", async () => {
     const { pi, commands } = makeFakePi();
     indexDefault(pi);
     const cmd = commands.get("loopcheck");
@@ -289,8 +338,15 @@ describe("index.ts adapter (fake PiLike)", () => {
 
     await cmd!.handler("", ctx as any);
     assert.match(notices[0], /anti-doom-loop: repeats>=3/);
+    assert.match(notices[0], /steers=0 aborts=0/);
+
+    await cmd!.handler("suspend", ctx as any);
+    assert.match(notices[1], /suspended/);
+
+    await cmd!.handler("resume", ctx as any);
+    assert.match(notices[2], /resumed/);
 
     await cmd!.handler("reset", ctx as any);
-    assert.match(notices[1], /counters reset/);
+    assert.match(notices[3], /counters reset/);
   });
 });

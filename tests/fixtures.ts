@@ -56,6 +56,20 @@ export const growingTextLoopSpaced = {
   ],
 };
 
+/**
+ * Live capture from a pi session: the model repeated a regex pattern 3+ times
+ * inside one message while searching; the within-message signal fired and the
+ * steer message broke the loop.
+ */
+export const regexRepeatLoop = {
+  name: "regex pattern repeated inside one message (live capture)",
+  messages: [
+    'Let me search for parameter\\s+(\\S+)\\s+(" in the test file.',
+    "Searching for the pattern now.",
+    'parameter\\s+(\\S+)\\s+(": parameter\\s+(\\S+)\\s+(": parameter\\s+(\\S+)\\s+("',
+  ],
+};
+
 /** Repeated identical tool calls from the CI-log investigation. */
 export const toolLoopGhRunView = {
   name: "repeated identical `gh run view --log` calls",

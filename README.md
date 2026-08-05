@@ -51,15 +51,17 @@ Environment variables, read at session/prompt start:
 
 ## Command
 
-- `/loopcheck` — show current thresholds and counters
+- `/loopcheck` — show thresholds, counters (steers/aborts this session), suspend state
 - `/loopcheck reset` — clear counters
+- `/loopcheck suspend` — pause detection until the next prompt (escape hatch for intentional repetition)
+- `/loopcheck resume` — re-enable detection early
 
 ## How it works
 
-Everything hooks into the `tool_call` / `tool_result` events; detection is a
-small sliding-window counter (see `extensions/detector.ts`) with no state kept
-between user prompts. Works with any model — cheap models just trigger it more
-often.
+Everything hooks into the `tool_call` / `tool_result` / `message_end` events;
+detection is a small sliding-window counter (see `extensions/detector.ts`) with
+per-session counters (steers/aborts) tracked in `extensions/controller.ts`.
+Works with any model — cheap models just trigger it more often.
 
 ## Development
 
