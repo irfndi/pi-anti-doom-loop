@@ -10,6 +10,7 @@ import {
   signature,
   normalizeText,
   truncate,
+  repeatedSegment,
   readOptions,
   DEFAULT_OPTIONS,
   type LoopOptions,
@@ -132,6 +133,79 @@ describe("verbatim text detection", () => {
     d.checkText("");
     d.checkText("   ");
     assert.ok(d.checkText("").isErr());
+  });
+});
+
+describe("within-message self-repetition (repeatedSegment)", () => {
+  it("fires when a long sentence repeats 3+ times inside one message", () => {
+    const msg = "Let me view the failing test context in the CI log:".repeat(3);
+    const chunk = repeatedSegment(normalizeText(msg), 3);
+    assert.equal(chunk, "Let me view the failing test context in the CI log");
+  });
+
+  it("handles dot-separated repeats", () => {
+    const msg =
+      "Let me check the CI failure output. Let me check the CI failure output. Let me check the CI failure output.";
+    assert.equal(repeatedSegment(normalizeText(msg), 3), "Let me check the CI failure output");
+  });
+
+  it("handles whitespace drift between repeats", () => {
+    const msg =
+      "Let me view the failing test context in the CI log: Let me view the failing test context in the CI log: Let me view the failing test context in the CI log:";
+    assert.equal(
+      repeatedSegment(normalizeText(msg), 3),
+      "Let me view the failing test context in the CI log",
+    );
+  });
+
+  it("fires at 4 repeats", () => {
+    const msg = "Let me view the failing test context in the CI log:".repeat(4);
+    assert.equal(
+      repeatedSegment(normalizeText(msg), 3),
+      "Let me view the failing test context in the CI log",
+    );
+  });
+
+  it("does not fire on a single sentence", () => {
+    assert.equal(repeatedSegment("Let me view the failing test context in the CI log:", 3), null);
+  });
+
+  it("does not fire on two repeats (emphasis, not a loop)", () => {
+    const msg = "Let me view the failing test context in the CI log:".repeat(2);
+    assert.equal(repeatedSegment(normalizeText(msg), 3), null);
+  });
+
+  it("does not fire on short segments (pasted logs with one-word lines)", () => {
+    assert.equal(repeatedSegment("Error. Error. Error.", 3), null, "segments < MIN_REPEAT_CHUNK");
+    assert.equal(repeatedSegment("Read. Read. Read. Read.", 3), null);
+  });
+
+  it("does not fire on distinct sentences", () => {
+    const msg = "Open the file. Read the tests. Run the suite. Check the output.";
+    assert.equal(repeatedSegment(msg, 3), null);
+  });
+});
+
+describe("within-message detection through checkText", () => {
+  it("aborts on the growing self-concatenation pattern even though messages differ", () => {
+    const d = new LoopDetector(opts);
+    const s = "Let me view the failing test context in the CI log";
+    // Each message grows by one copy: verbatim streak never forms.
+    assert.ok(d.checkText(s + ":").isErr());
+    assert.ok(d.checkText((s + ":").repeat(2)).isErr(), "2 repeats inside one message: not yet");
+    const hit = d.checkText((s + ":").repeat(3));
+    assert.ok(hit.isOk(), "3 repeats inside one message: fire");
+    if (hit.isOk()) {
+      assert.match(hit.value.reason, /within a single message/);
+      assert.match(hit.value.reason, /aborted/);
+    }
+    assert.ok(d.checkText((s + ":").repeat(4)).isErr(), "fires only once per run");
+  });
+
+  it("fires even when the first message already contains the repetition", () => {
+    const d = new LoopDetector(opts);
+    const hit = d.checkText("Let me view the failing test context in the CI log:".repeat(3));
+    assert.ok(hit.isOk(), "first message with 3 repeats fires immediately");
   });
 });
 

@@ -142,6 +142,23 @@ export class LoopDetector {
   checkText(text: string): Result<{ reason: string }, undefined> {
     const norm = normalizeText(text);
     if (!norm) return Result.err(undefined); // blank text is not a loop signal
+
+    // Within-message self-repetition: the model pastes the same sentence
+    // `textRepeatThreshold`+ times inside ONE message (growing loops like
+    // "…X:…X:…X"). Liquid.ai's loop definition — a section repeats at least N
+    // times. No streak needed: the message itself is the loop.
+    if (!this.textFired) {
+      const chunk = repeatedSegment(norm, this.opts.textRepeatThreshold);
+      if (chunk !== null) {
+        this.textFired = true;
+        return Result.ok({
+          reason:
+            `Assistant message repeats "${truncate(chunk, 60)}" ${this.opts.textRepeatThreshold}+ times ` +
+            `within a single message. You appear to be in a loop — this run is aborted.`,
+        });
+      }
+    }
+
     this.textStreak = norm === this.lastText ? this.textStreak + 1 : 1;
     this.lastText = norm;
     if (this.textStreak >= this.opts.textRepeatThreshold && !this.textFired) {
@@ -190,6 +207,33 @@ export function normalizeText(text: string): string {
 /** First `max` chars of a single-line string, with an ellipsis. */
 export function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+/** Minimum length of a segment worth treating as a repeated loop chunk. */
+export const MIN_REPEAT_CHUNK = 16;
+
+/**
+ * Returns the first sentence-ish segment that repeats `threshold` times
+ * within a single normalized message, or null.
+ *
+ * Catches growing doom loops where the model self-concatenates the same
+ * sentence ("…X:…X:…X") — the pattern that evaded cross-message verbatim
+ * detection in production (each message differs, so no streak forms).
+ * Short segments (< MIN_REPEAT_CHUNK) are ignored so pasted logs with
+ * repeated one-word lines never false-positive.
+ */
+export function repeatedSegment(normalized: string, threshold: number): string | null {
+  const segments = normalized
+    .split(/(?<=[.:!?])\s*/)
+    .map((s) => s.trim().replace(/[.:!?]+$/, ""))
+    .filter((s) => s.length >= MIN_REPEAT_CHUNK);
+  const counts = new Map<string, number>();
+  for (const seg of segments) {
+    const n = (counts.get(seg) ?? 0) + 1;
+    if (n >= threshold) return seg;
+    counts.set(seg, n);
+  }
+  return null;
 }
 
 // --- self-check (runs under `node extensions/detector.ts`, skipped when loaded by pi) ---

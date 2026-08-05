@@ -153,6 +153,32 @@ describe("fuzz: any stream with N identical calls must block", () => {
   });
 });
 
+describe("fuzz: within-message self-repetition", () => {
+  it("random text never fires the within-message signal", () => {
+    const rand = rng(0xbeef0001);
+    const d = new LoopDetector(opts);
+    for (let i = 0; i < 300; i++) {
+      const len = Math.floor(rand() * 8);
+      let text = "";
+      for (let j = 0; j < len; j++) text += `random sentence number ${i}-${j}. `; // unique per position: no repeats possible
+      assert.ok(d.checkText(text).isErr(), `random text must not fire: ${text.slice(0, 60)}`);
+    }
+  });
+
+  it("an injected 3x-repeated sentence always fires", () => {
+    const rand = rng(0xbeef0002);
+    const d = new LoopDetector(opts);
+    let fired = false;
+    for (let i = 0; i < 100; i++) {
+      const s = "Let me view the failing test context in the CI log";
+      const repeats = 1 + Math.floor(rand() * 5);
+      const text = (s + ":").repeat(repeats);
+      if (d.checkText(text).isOk()) fired = true;
+    }
+    assert.ok(fired, "at least one message with 3+ repeats must fire");
+  });
+});
+
 describe("fuzz: canonical stability", () => {
   it("equivalent structures canonicalize identically", () => {
     const rand = rng(7);

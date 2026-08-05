@@ -31,6 +31,31 @@ export const textLoopBuildProgram = {
   ],
 };
 
+/**
+ * same sentence, so consecutive messages differ (verbatim streak never
+ * forms) and the repeated tool args vary (identical-call check misses).
+ * The signal is the sentence repeating WITHIN one message.
+ */
+export const growingTextLoop = {
+  name: "production restart — growing self-concatenation 'Let me view the failing test context'",
+  messages: [
+    "Let me view the failing test context in the CI log:",
+    "Let me view the failing test context in the CI log:Let me view the failing test context in the CI log:",
+    "Let me view the failing test context in the CI log:Let me view the failing test context in the CI log:Let me view the failing test context in the CI log:",
+    "Let me view the failing test context in the CI log:Let me view the failing test context in the CI log:Let me view the failing test context in the CI log:Let me view the failing test context in the CI log:",
+  ],
+};
+
+/** Same loop but with whitespace/punctuation drift between repeats. */
+export const growingTextLoopSpaced = {
+  name: "growing loop with spacing drift",
+  messages: [
+    "Let me view the failing test context in the CI log:",
+    "Let me view the failing test context in the CI log: Let me view the failing test context in the CI log:",
+    "Let me view the failing test context in the CI log: Let me view the failing test context in the CI log: Let me view the failing test context in the CI log:",
+  ],
+};
+
 /** Repeated identical tool calls from the CI-log investigation. */
 export const toolLoopGhRunView = {
   name: "repeated identical `gh run view --log` calls",

@@ -15,17 +15,18 @@ pi install npm:pi-anti-doom-loop
 
 ## What it detects
 
-| Signal                          | Default                 | Blocked when                                                    |
-| ------------------------------- | ----------------------- | --------------------------------------------------------------- |
-| Same `(tool, args)` repeated    | 3× in the last 10 calls | The pattern has repeated `3` times with no change               |
-| Same tool failing consecutively | 3×                      | A tool errored `3` times in a row — stop retrying it blindly    |
-| Same assistant text verbatim    | 3× in a row             | The model re-emitted identical text `3` times (text-only loops) |
+| Signal                           | Default                 | Blocked when                                                                             |
+| -------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------- |
+| Same `(tool, args)` repeated     | 3× in the last 10 calls | The pattern has repeated `3` times with no change                                        |
+| Same tool failing consecutively  | 3×                      | A tool errored `3` times in a row — stop retrying it blindly                             |
+| Same assistant text verbatim     | 3× in a row             | The model re-emitted identical text `3` times (text-only loops)                          |
+| Same sentence inside ONE message | 3×                      | A sentence repeats `3`+ times within a single message (growing self-concatenation loops) |
 
 Blocks hand the model an instructive reason ("change your approach, use a
 different tool, or ask the user"). If the model ignores the block and re-issues
-the exact same call, the turn is **aborted** and you are notified. A verbatim
-text loop (no tool calls involved) aborts the run immediately with a
-notification.
+the exact same call, the turn is **aborted** and you are notified. Verbatim
+text loops and within-message self-repetition (no tool calls involved) abort
+the run immediately with a notification.
 
 Counters reset on every user prompt, so a task legitimately repeated later in
 the same session is never a false positive.

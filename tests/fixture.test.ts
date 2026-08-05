@@ -9,6 +9,8 @@ import { createController } from "../extensions/controller.ts";
 import {
   textLoop,
   textLoopBuildProgram,
+  growingTextLoop,
+  growingTextLoopSpaced,
   toolLoopGhRunView,
   toolLoopGrepSameFile,
   healthySession,
@@ -39,6 +41,20 @@ describe("fixtures: identical tool calls (controller path)", () => {
         c.onToolResult(call.tool, `call-${i}`, false);
       });
       assert.ok(blocked, "the identical-call loop must be blocked");
+    });
+  }
+});
+
+describe("fixtures: growing self-concatenation loops (within-message signal)", () => {
+  for (const fixture of [growingTextLoop, growingTextLoopSpaced]) {
+    it(`catches: ${fixture.name}`, () => {
+      const c = createController();
+      let aborted = false;
+      for (const message of fixture.messages) {
+        const outcome = c.onMessageEnd("assistant", [{ type: "text", text: message }]);
+        if (outcome !== null) aborted = true;
+      }
+      assert.ok(aborted, "the growing self-concatenation loop must trigger an abort");
     });
   }
 });
