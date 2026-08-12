@@ -2,6 +2,25 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [Unreleased]
+
+### Added
+
+- **Near-identical text cycle detection** — `checkText` now fires when near-identical assistant texts (token similarity ≥ 55%) accumulate to the text-repeat threshold within the sliding window, even when they are not identical and not consecutive. Catches a rotating set of rephrased commands ("Run the test." / "Run tests now." / "Let me run the test.") that never repeat verbatim. New block reason prefix: _"Assistant sent near-identical text N times within the last M messages"_.
+- **Token-cost awareness** — the detector estimates tokens burned on redundant repeats (~4 chars/token) and reports `~N tokens burned on repeats.` in tool-call block reasons; the cumulative wasted-token count appears in `/loopcheck` status.
+- **Time-windowed eviction** — optional `PI_ANTI_LOOP_TIME_WINDOW` (elapsed-time window in ms; default `0` = disabled, count-only) so slow chronic loops spread over a long session are caught.
+- **Failure-rate window** — optional `PI_ANTI_LOOP_FAIL_RATE` (0..1, default `0` = disabled) blocks a tool when its error share of in-window calls reaches the threshold, with `PI_ANTI_LOOP_FAIL_RATE_MIN` (default `3`) as the minimum-calls gate. Catches flaky retries interleaved with successes that never form a consecutive streak.
+- **Per-tool allowlist** — `PI_ANTI_LOOP_TOOLS_EXCLUDE` (comma-separated tool names) disables detection for those tools entirely: they never block and never enter the window.
+- **Richer `/loopcheck` diagnostics** — status now shows the current window contents (most-repeated recent calls and texts) and the wasted-token count, plus the fail-rate/time-window/exclude config when enabled.
+
+### Changed
+
+- **Same assistant text verbatim** now uses window semantics: it blocks on `3× within the last N messages` rather than strictly "in a row", consistent with the sliding-window repeat threshold.
+
+### Tests
+
+- Detection and regression coverage for the near-identical text cycle, token-cost reporting, time-windowed eviction, failure-rate window, per-tool exclusion, and the richer `/loopcheck` status.
+
 ## [0.0.5] — 2026-08-05
 
 ### Added

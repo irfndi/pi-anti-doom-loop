@@ -15,13 +15,14 @@ pi install npm:pi-anti-doom-loop
 
 ## What it detects
 
-| Signal                           | Default                 | Blocked when                                                                             |
-| -------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------- |
-| Same `(tool, args)` repeated     | 3× in the last 10 calls | The pattern has repeated `3` times with no change                                        |
-| Same tool failing consecutively  | 3×                      | A tool errored `3` times in a row — stop retrying it blindly                             |
-| Same assistant text verbatim     | 3× in a row             | The model re-emitted identical text `3` times (text-only loops)                          |
-| Same sentence inside ONE message | 3×                      | A sentence repeats `3`+ times within a single message (growing self-concatenation loops) |
-| Near-identical text (rephrasing) | 3× in a row             | Consecutive messages share ≥55% tokens — the model is rephrasing the same step           |
+| Signal                                                  | Default                       | Blocked when                                                                                                                                         |
+| ------------------------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Same `(tool, args)` repeated                            | 3× in the last 10 calls       | The pattern has repeated `3` times with no change                                                                                                    |
+| Same tool failing consecutively                         | 3×                            | A tool errored `3` times in a row — stop retrying it blindly                                                                                         |
+| Same assistant text verbatim                            | 3× within the last N messages | The model re-emitted identical text `3` times inside the sliding window                                                                              |
+| Same sentence inside ONE message                        | 3×                            | A sentence repeats `3`+ times within a single message (growing self-concatenation loops)                                                             |
+| Near-identical text (rephrasing)                        | 3× in a row                   | Consecutive messages share ≥55% tokens — the model is rephrasing the same step                                                                       |
+| Near-identical text cycle (rotating rephrased commands) | 3× within the last N messages | Near-identical assistant texts (≥55% token similarity) accumulate to the repeat threshold in the window, even when not identical and not consecutive |
 
 Blocks hand the model an instructive reason ("change your approach, use a
 different tool, or ask the user"). If the model ignores the block and re-issues
@@ -41,20 +42,31 @@ the same session is never a false positive.
 
 Environment variables, read at session/prompt start:
 
-| Variable                    | Default | Meaning                                            |
-| --------------------------- | ------- | -------------------------------------------------- |
-| `PI_ANTI_LOOP_REPEATS`      | `3`     | Identical-call block threshold                     |
-| `PI_ANTI_LOOP_FAILS`        | `3`     | Consecutive-failure block threshold                |
-| `PI_ANTI_LOOP_TEXT_REPEATS` | `3`     | Consecutive identical assistant texts before abort |
-| `PI_ANTI_LOOP_WINDOW`       | `10`    | How many recent calls/results are inspected        |
-| `PI_ANTI_LOOP_DISABLE`      | —       | Set to `1` to disable the extension entirely       |
+| Variable                     | Default | Meaning                                                                                                                                            |
+| ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PI_ANTI_LOOP_REPEATS`       | `3`     | Identical-call block threshold                                                                                                                     |
+| `PI_ANTI_LOOP_FAILS`         | `3`     | Consecutive-failure block threshold                                                                                                                |
+| `PI_ANTI_LOOP_TEXT_REPEATS`  | `3`     | Window/cycle repeat threshold for identical and near-identical assistant texts                                                                     |
+| `PI_ANTI_LOOP_WINDOW`        | `10`    | How many recent calls/results are inspected                                                                                                        |
+| `PI_ANTI_LOOP_TIME_WINDOW`   | `0`     | Elapsed-time window in ms (`0` = disabled, count-only): evicts window entries older than this so slow chronic loops over a long session are caught |
+| `PI_ANTI_LOOP_FAIL_RATE`     | `0`     | Fail-rate block threshold `0..1` (`0` = disabled): block when a tool's error share of its in-window calls reaches this                             |
+| `PI_ANTI_LOOP_FAIL_RATE_MIN` | `3`     | Minimum calls before the fail-rate window can block                                                                                                |
+| `PI_ANTI_LOOP_TOOLS_EXCLUDE` | —       | Comma-separated tool names to disable detection for entirely (never block, never enter the window)                                                 |
+| `PI_ANTI_LOOP_DISABLE`       | —       | Set to `1` to disable the extension entirely                                                                                                       |
 
 ## Command
 
-- `/loopcheck` — show thresholds, counters (steers/aborts this session), suspend state
+- `/loopcheck` — show thresholds, counters (steers/aborts this session), suspend state, the current window contents (most-repeated recent calls and texts), wasted-token count, and the fail-rate/time-window/exclude config when enabled
 - `/loopcheck reset` — clear counters
 - `/loopcheck suspend` — pause detection until the next prompt (escape hatch for intentional repetition)
 - `/loopcheck resume` — re-enable detection early
+
+## Token-cost awareness
+
+The detector estimates tokens burned on redundant repeats (~4 chars/token) and
+reports `"~N tokens burned on repeats."` in tool-call block reasons. The
+cumulative wasted-token count also appears in `/loopcheck` status, so you can
+see how much a loop actually cost before it was stopped.
 
 ## How it works
 
@@ -65,7 +77,7 @@ Works with any model — cheap models just trigger it more often.
 
 ## Development
 
-Requires Node 22.6+ (plain `node` runs the TS self-check).
+Requires Node 22.18+ (plain `node` runs the TS self-check).
 
 ```bash
 npm install
