@@ -239,7 +239,7 @@ describe("controller: reset", () => {
     assert.match(s, /repeats>=3\/window 10/);
     assert.match(s, /fails>=3/);
     assert.match(s, /text>=3/);
-    assert.match(s, /window: 0\/10 calls/);
+    assert.match(s, /calls\[0\]/);
   });
 });
 

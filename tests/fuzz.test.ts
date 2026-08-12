@@ -66,6 +66,10 @@ const opts: LoopOptions = {
   failThreshold: 3,
   windowSize: 10,
   textRepeatThreshold: 3,
+  timeWindowMs: 0,
+  failRateThreshold: 0,
+  failRateMinCalls: 3,
+  toolExclude: new Set(),
 };
 
 describe("fuzz: no-crash on arbitrary inputs", () => {
@@ -150,6 +154,29 @@ describe("fuzz: any stream with N identical calls must block", () => {
       if (d.checkText(text).isOk()) fired = true;
     }
     assert.ok(fired);
+  });
+
+  it("injected identical calls still block with the new default fields", () => {
+    const rand = rng(0xfeedface);
+    for (let run = 0; run < 20; run++) {
+      const d = new LoopDetector(opts);
+      const loopCall = { command: `gh run view ${run} --log` };
+      const sequence: Array<{ tool: string; args: unknown }> = [
+        { tool: "bash", args: loopCall },
+        { tool: "bash", args: loopCall },
+        { tool: "bash", args: loopCall },
+      ];
+      for (let i = 0; i < 30; i++) {
+        const tool = TOOLS[Math.floor(rand() * TOOLS.length)];
+        sequence.push({ tool, args: { ...randomArgs(rand), _seq: i } });
+      }
+      let blocked = false;
+      for (const call of sequence) {
+        if (d.check(call.tool, call.args).isOk()) blocked = true;
+        d.record(call.tool, call.args);
+      }
+      assert.ok(blocked, `injected loop must block with new defaults (run ${run})`);
+    }
   });
 });
 

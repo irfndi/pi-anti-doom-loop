@@ -22,6 +22,10 @@ const opts: LoopOptions = {
   failThreshold: 3,
   windowSize: 10,
   textRepeatThreshold: 3,
+  timeWindowMs: 0,
+  failRateThreshold: 0,
+  failRateMinCalls: 3,
+  toolExclude: new Set(),
 };
 
 describe("identical-call detection", () => {
@@ -67,6 +71,51 @@ describe("identical-call detection", () => {
     for (let i = 0; i < opts.windowSize; i++) d.record("bash", { command: `cmd ${i}` });
     assert.ok(d.check("bash", { command: "cmd 0" }).isErr(), "evicted repeat does not count");
   });
+
+  it("accumulates wasted tokens on identical repeats and reports them in the block reason", () => {
+    const d = new LoopDetector(opts);
+    const args = { command: "grep foo bar.ts" };
+    d.check("bash", args);
+    d.record("bash", args);
+    d.check("bash", args);
+    d.record("bash", args);
+    const hit = d.check("bash", args);
+    assert.ok(hit.isOk(), "3rd identical call blocks");
+    assert.ok(d.wastedTokensCount() > 0, "redundant repeats accumulate wasted tokens");
+    if (hit.isOk()) {
+      assert.match(hit.value.reason, /tokens burned on repeats/);
+    }
+  });
+
+  it("diagnostics reports the wasted-token count", () => {
+    const d = new LoopDetector(opts);
+    const args = { command: "grep foo bar.ts" };
+    d.check("bash", args);
+    d.record("bash", args);
+    d.check("bash", args);
+    d.record("bash", args);
+    d.check("bash", args);
+    assert.match(d.diagnostics(), /wastedTokens=\d+/);
+  });
+
+  it("evicts window entries older than the time window", () => {
+    const realNow = Date.now;
+    try {
+      let now = 1000;
+      Date.now = () => now;
+      const d = new LoopDetector({ ...opts, timeWindowMs: 500 });
+      d.record("bash", { command: "cmd" }); // ts 1000
+      now = 1200;
+      d.record("bash", { command: "cmd" }); // ts 1200
+      now = 1800; // cutoff 1300: the ts=1000 entry is evicted
+      assert.ok(
+        d.check("bash", { command: "cmd" }).isErr(),
+        "only 2 in-window repeats after eviction must not block",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
 });
 
 describe("consecutive-failure detection", () => {
@@ -95,6 +144,55 @@ describe("consecutive-failure detection", () => {
     d.recordResult("read", true);
     d.recordResult("bash", true);
     assert.ok(d.check("bash", { command: "npm test" }).isErr(), "not 3 consecutive bash errors");
+  });
+});
+
+describe("failure-rate detection", () => {
+  it("blocks on a failure-rate threshold with interleaved successes", () => {
+    const d = new LoopDetector({ ...opts, failRateThreshold: 0.6, failRateMinCalls: 3 });
+    d.recordResult("bash", true); // error
+    d.recordResult("bash", false); // success
+    d.recordResult("bash", true); // error
+    const hit = d.check("bash", { command: "npm test" });
+    assert.ok(hit.isOk(), "2 of 3 errors (67%) >= 0.6 must block");
+    if (hit.isOk()) {
+      assert.match(hit.value.reason, /failed 2 of 3 calls in the window/);
+    }
+  });
+
+  it("does not fire below the minimum call count", () => {
+    const d = new LoopDetector({ ...opts, failRateThreshold: 0.6, failRateMinCalls: 3 });
+    d.recordResult("bash", true);
+    d.recordResult("bash", true);
+    assert.ok(d.check("bash", { command: "npm test" }).isErr(), "2 calls < failRateMinCalls");
+  });
+
+  it("does not fire below the rate threshold", () => {
+    const d = new LoopDetector({ ...opts, failRateThreshold: 0.8, failRateMinCalls: 3 });
+    d.recordResult("bash", true);
+    d.recordResult("bash", false);
+    d.recordResult("bash", true);
+    assert.ok(d.check("bash", { command: "npm test" }).isErr(), "67% < 80%");
+  });
+});
+
+describe("tool exclusion", () => {
+  it("tools in toolExclude are never blocked and never enter the window", () => {
+    const d = new LoopDetector({ ...opts, toolExclude: new Set(["bash"]) });
+    // Excluded tool: never blocks even with identical args many times.
+    for (let i = 0; i < 5; i++) {
+      assert.ok(d.check("bash", { command: "grep foo" }).isErr(), "excluded tool must not block");
+      d.record("bash", { command: "grep foo" });
+    }
+    assert.equal(d.wastedTokensCount(), 0, "excluded calls never accumulate wasted tokens");
+    assert.match(d.diagnostics(), /calls\[0\]/, "excluded tool never enters the window");
+
+    // A non-excluded tool's window is unaffected: identical repeats still block.
+    const d2 = new LoopDetector({ ...opts, toolExclude: new Set(["bash"]) });
+    d2.record("read", { path: "a" });
+    d2.record("read", { path: "a" });
+    const hit = d2.check("read", { path: "a" });
+    assert.ok(hit.isOk(), "non-excluded tool still blocks on identical repeats");
   });
 });
 
@@ -276,16 +374,39 @@ describe("near-identical text (tokenSimilarity)", () => {
     if (hit.isOk()) assert.match(hit.value.reason, /identical or near-identical text 3 times/);
   });
 
-  it("a genuinely different message resets the similarity streak", () => {
+  it("a genuinely different message does NOT let 3 near-identical texts escape detection", () => {
     const d = new LoopDetector(opts);
     d.checkText("Let me re-download the log and inspect the failing test");
     d.checkText("Let me re-download the log and examine the failing assertion");
     d.checkText("The build passed and all tests are green now");
     d.checkText("Let me re-download the log and inspect the failing test");
-    assert.ok(
-      d.checkText("Let me re-download the log and examine the failing assertion").isErr(),
-      "streak reset by the different message",
-    );
+    // Message 5 is near-identical to messages 1, 2 and 4 within the window, so
+    // the near-identical window repeat (feature A) fires even though the
+    // interleaved message reset the consecutive streak.
+    const hit = d.checkText("Let me re-download the log and examine the failing assertion");
+    assert.ok(hit.isOk(), "near-identical texts spread across the window must fire");
+    if (hit.isOk()) {
+      assert.match(hit.value.reason, /near-identical text 3 times within the last/);
+    }
+  });
+
+  it("fires a near-identical window repeat on a rotating, non-consecutive cycle", () => {
+    const d = new LoopDetector(opts);
+    // Three lightly rephrased commands (mutually similar but never identical),
+    // interleaved with a genuinely different message so the consecutive streak
+    // stays at 1. Feature A fires when the window accumulates 3 similar texts.
+    const t1 = "Run the test suite and report the failures now";
+    const t2 = "Run the test suite and report the failures please";
+    const t3 = "Run the test suite and report the failures today";
+    const diff = "The build passed so we deploy the app to production";
+    assert.ok(d.checkText(t1).isErr());
+    assert.ok(d.checkText(t2).isErr(), "2nd similar message: streak 2, window 2 — not yet");
+    assert.ok(d.checkText(diff).isErr(), "different message keeps the streak at 1");
+    const hit = d.checkText(t3);
+    assert.ok(hit.isOk(), "3 near-identical texts in the window must fire");
+    if (hit.isOk()) {
+      assert.match(hit.value.reason, /near-identical text 3 times within the last/);
+    }
   });
 });
 
@@ -311,6 +432,38 @@ describe("options", () => {
       DEFAULT_OPTIONS.windowSize,
     );
     assert.equal(readOptions({ PI_ANTI_LOOP_WINDOW: "" }).windowSize, DEFAULT_OPTIONS.windowSize);
+  });
+
+  it("parses PI_ANTI_LOOP_TIME_WINDOW", () => {
+    assert.equal(readOptions({ PI_ANTI_LOOP_TIME_WINDOW: "5000" }).timeWindowMs, 5000);
+    assert.equal(readOptions({ PI_ANTI_LOOP_TIME_WINDOW: "0" }).timeWindowMs, 0);
+    assert.equal(readOptions({ PI_ANTI_LOOP_TIME_WINDOW: "-5" }).timeWindowMs, 0);
+    assert.equal(readOptions({ PI_ANTI_LOOP_TIME_WINDOW: "abc" }).timeWindowMs, 0);
+  });
+
+  it("clamps PI_ANTI_LOOP_FAIL_RATE to [0,1]", () => {
+    assert.equal(readOptions({ PI_ANTI_LOOP_FAIL_RATE: "1.5" }).failRateThreshold, 1);
+    assert.equal(readOptions({ PI_ANTI_LOOP_FAIL_RATE: "-0.5" }).failRateThreshold, 0);
+    assert.equal(readOptions({ PI_ANTI_LOOP_FAIL_RATE: "0.6" }).failRateThreshold, 0.6);
+    assert.equal(readOptions({ PI_ANTI_LOOP_FAIL_RATE: "abc" }).failRateThreshold, 0);
+  });
+
+  it("parses PI_ANTI_LOOP_TOOLS_EXCLUDE into a set", () => {
+    const o = readOptions({ PI_ANTI_LOOP_TOOLS_EXCLUDE: "bash, read,edit,," });
+    assert.ok(o.toolExclude instanceof Set);
+    assert.ok(o.toolExclude.has("bash"));
+    assert.ok(o.toolExclude.has("read"));
+    assert.ok(o.toolExclude.has("edit"));
+    assert.equal(o.toolExclude.size, 3);
+    assert.equal(readOptions({}).toolExclude.size, 0);
+  });
+
+  it("accepts a fail-rate minimum", () => {
+    assert.equal(readOptions({ PI_ANTI_LOOP_FAIL_RATE_MIN: "5" }).failRateMinCalls, 5);
+    assert.equal(
+      readOptions({ PI_ANTI_LOOP_FAIL_RATE_MIN: "1" }).failRateMinCalls,
+      DEFAULT_OPTIONS.failRateMinCalls,
+    );
   });
 });
 
