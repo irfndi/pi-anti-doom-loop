@@ -20,8 +20,21 @@ export interface LoopOptions {
   failThreshold: number;
   /** How many recent calls/results are inspected for repetition. */
   windowSize: number;
-  /** Consecutive verbatim assistant messages that trigger an abort. */
+  /** Verbatim/near-identical assistant-message repeats that trigger a block. */
   textRepeatThreshold: number;
+  /** Evict window entries older than this many ms (0 = count-only window). */
+  timeWindowMs: number;
+  /**
+   * Failure-rate threshold (0..1). When a tool's error share of its calls in
+   * the window is >= this (and it has >= failRateMinCalls calls), block. This
+   * catches flaky/ungrounded retries that are interleaved with successes and
+   * never form a consecutive streak. 0 = disabled.
+   */
+  failRateThreshold: number;
+  /** Minimum calls before the failure-rate signal applies. */
+  failRateMinCalls: number;
+  /** Tool names to skip detection for entirely (intentional repetition). */
+  toolExclude: Set<string>;
 }
 
 export const DEFAULT_OPTIONS: LoopOptions = {
@@ -29,6 +42,10 @@ export const DEFAULT_OPTIONS: LoopOptions = {
   failThreshold: 3,
   windowSize: 10,
   textRepeatThreshold: 3,
+  timeWindowMs: 0,
+  failRateThreshold: 0,
+  failRateMinCalls: 3,
+  toolExclude: new Set(),
 };
 
 export function readOptions(env: Record<string, string | undefined> = process.env): LoopOptions {
@@ -40,11 +57,23 @@ export function readOptions(env: Record<string, string | undefined> = process.en
     const n = Number(raw);
     return Number.isFinite(n) && n >= 2 ? n : fallback;
   };
+  const timeWindow = Number(env["PI_ANTI_LOOP_TIME_WINDOW"] ?? "0");
+  const failRate = Number(env["PI_ANTI_LOOP_FAIL_RATE"] ?? "0");
+  const toolExclude = new Set(
+    (env["PI_ANTI_LOOP_TOOLS_EXCLUDE"] ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
   return {
     repeatThreshold: num("PI_ANTI_LOOP_REPEATS", DEFAULT_OPTIONS.repeatThreshold),
     failThreshold: num("PI_ANTI_LOOP_FAILS", DEFAULT_OPTIONS.failThreshold),
     windowSize: num("PI_ANTI_LOOP_WINDOW", DEFAULT_OPTIONS.windowSize),
     textRepeatThreshold: num("PI_ANTI_LOOP_TEXT_REPEATS", DEFAULT_OPTIONS.textRepeatThreshold),
+    timeWindowMs: Number.isFinite(timeWindow) && timeWindow >= 0 ? timeWindow : 0,
+    failRateThreshold: Number.isFinite(failRate) ? Math.min(1, Math.max(0, failRate)) : 0,
+    failRateMinCalls: num("PI_ANTI_LOOP_FAIL_RATE_MIN", DEFAULT_OPTIONS.failRateMinCalls),
+    toolExclude,
   };
 }
 
@@ -77,26 +106,33 @@ export interface BlockDecision {
  */
 export class LoopDetector {
   readonly opts: LoopOptions;
-  private recentSigs: string[] = [];
-  private recentResults: { tool: string; error: boolean }[] = [];
+  private recentSigs: { sig: string; ts: number }[] = [];
+  private recentResults: { tool: string; error: boolean; ts: number }[] = [];
   private blockedBySig = new Map<string, number>();
-  private recentTexts: string[] = [];
+  private recentTexts: { text: string; ts: number }[] = [];
   private lastText: string | null = null;
   private textStreak = 0;
-  private textFired = false;
+  private wastedTokens = 0;
 
   constructor(opts: LoopOptions = DEFAULT_OPTIONS) {
     this.opts = opts;
   }
 
   check(toolName: string, input: unknown): Result<BlockDecision, undefined> {
-    const sig = signature(toolName, input);
-    const repeats = this.recentSigs.filter((s) => s === sig).length;
-    const total = repeats + 1; // including this call
-    const fails = this.consecutiveFails(toolName);
-
-    if (total < this.opts.repeatThreshold && fails < this.opts.failThreshold)
+    if (this.opts.toolExclude.has(toolName)) {
+      // record() is a no-op for excluded tools, so nothing enters the window.
       return Result.err(undefined);
+    }
+    this.evictSigs();
+    const sig = signature(toolName, input);
+    const repeats = this.recentSigs.filter((s) => s.sig === sig).length;
+    const total = repeats + 1; // including this call
+    const consecutiveFails = this.consecutiveFails(toolName);
+    const rate = this.failRate(toolName);
+
+    // Rough cost accounting (feature B): every redundant repeat of an already
+    // present signature burns tokens with no new information.
+    if (repeats >= 1) this.wastedTokens += estimateTokens(stringify(input));
 
     const reasons: string[] = [];
     if (total >= this.opts.repeatThreshold) {
@@ -104,36 +140,49 @@ export class LoopDetector {
         `"${toolName}" was called with identical arguments ${total} times in the last ${this.opts.windowSize} tool calls with no change`,
       );
     }
-    if (fails >= this.opts.failThreshold) {
-      reasons.push(`"${toolName}" failed ${fails} consecutive times`);
+    if (consecutiveFails >= this.opts.failThreshold) {
+      reasons.push(`"${toolName}" failed ${consecutiveFails} consecutive times`);
     }
+    if (
+      this.opts.failRateThreshold > 0 &&
+      rate.calls >= this.opts.failRateMinCalls &&
+      rate.rate >= this.opts.failRateThreshold
+    ) {
+      reasons.push(
+        `"${toolName}" failed ${rate.errors} of ${rate.calls} calls in the window (${Math.round(rate.rate * 100)}%)`,
+      );
+    }
+
+    if (reasons.length === 0) return Result.err(undefined);
 
     const blockedCount = (this.blockedBySig.get(sig) ?? 0) + 1;
     this.blockedBySig.set(sig, blockedCount);
+    const cost = this.wastedTokens > 0 ? ` ~${this.wastedTokens} tokens burned on repeats.` : "";
 
     return Result.ok({
       reason:
         reasons.join("; ") +
+        cost +
         `. BLOCKED by anti-doom-loop — you appear to be looping. Change your approach, use a different tool, or ask the user.`,
       escalate: blockedCount > 1,
     });
   }
 
   record(toolName: string, input: unknown): void {
-    this.recentSigs.push(signature(toolName, input));
-    if (this.recentSigs.length > this.opts.windowSize) this.recentSigs.shift();
+    if (this.opts.toolExclude.has(toolName)) return;
+    this.recentSigs.push({ sig: signature(toolName, input), ts: Date.now() });
+    this.evictSigs();
   }
 
   recordResult(toolName: string, error: boolean): void {
-    this.recentResults.push({ tool: toolName, error });
-    if (this.recentResults.length > this.opts.windowSize) this.recentResults.shift();
+    this.recentResults.push({ tool: toolName, error, ts: Date.now() });
+    this.evictResults();
   }
 
   /**
-   * Consecutive verbatim assistant text (whitespace-normalized). Fires once
-   * per run when the streak reaches textRepeatThreshold, then stays silent
-   * until reset — message_end cannot return a block, so the caller aborts.
-   * $
+   * Consecutive verbatim/near-identical assistant text (whitespace-normalized).
+   * The controller turns the first detection into a steer, later ones into
+   * aborts. $
    * Detects the text-only loop shape (model re-emits the same sentence
    * forever, e.g. goal-function loops) that identical-tool-call detection
    * never sees. Liquid.ai's Antidoom mines loops as 'a section repeats at
@@ -157,18 +206,20 @@ export class LoopDetector {
       });
     }
 
-    // Cross-message window repeat: the same text reappearing
+    // Cross-message window repeat (exact): the same text reappearing
     // textRepeatThreshold times within the recent-text window. Catches text
-    // CYCLES ("Run. GO." / "GO." / "Let me run. GO." …) that never form a
-    // 3-consecutive streak and are too short for repeatedSegment. Mirrors the
-    // tool-signature window in check().
-    const windowCount = this.recentTexts.filter((t) => t === norm).length + 1;
-    this.recentTexts.push(norm);
-    if (this.recentTexts.length > this.opts.windowSize) this.recentTexts.shift();
-    if (windowCount >= this.opts.textRepeatThreshold) {
+    // CYCLES that never form a 3-consecutive streak and are too short for
+    // repeatedSegment. Mirrors the tool-signature window in check().
+    const exactCount = this.recentTexts.filter((t) => t.text === norm).length + 1;
+    this.recentTexts.push({ text: norm, ts: Date.now() });
+    this.evictTexts();
+    if (this.recentTexts.filter((t) => t.text === norm).length >= 2) {
+      this.wastedTokens += estimateTokens(norm);
+    }
+    if (exactCount >= this.opts.textRepeatThreshold) {
       return Result.ok({
         reason:
-          `Assistant sent identical text ${windowCount} times within the last ${this.opts.windowSize} messages ` +
+          `Assistant sent identical text ${exactCount} times within the last ${this.opts.windowSize} messages ` +
           `("${truncate(norm, 80)}"). You appear to be in a loop.`,
       });
     }
@@ -189,6 +240,23 @@ export class LoopDetector {
           `("${truncate(norm, 80)}"). You appear to be in a loop.`,
       });
     }
+
+    // Cross-message window repeat (near-identical): a rotating set of
+    // rephrased commands ("Run the test." / "Run tests now." / "Let me run
+    // the test.") that is never identical and never consecutive, so both the
+    // exact window check and the streak above miss it. Similar, non-identical
+    // texts accumulating to textRepeatThreshold within the window fire here.
+    const similarCount =
+      this.recentTexts.filter(
+        (t) => t.text !== norm && tokenSimilarity(norm, t.text) >= TEXT_SIMILARITY_THRESHOLD,
+      ).length + 1;
+    if (similarCount >= this.opts.textRepeatThreshold) {
+      return Result.ok({
+        reason:
+          `Assistant sent near-identical text ${similarCount} times within the last ${this.opts.windowSize} messages ` +
+          `("${truncate(norm, 80)}"). You appear to be in a loop.`,
+      });
+    }
     return Result.err(undefined);
   }
 
@@ -203,6 +271,72 @@ export class LoopDetector {
     return n;
   }
 
+  /** Error share of all in-window results for a tool. */
+  private failRate(toolName: string): { calls: number; errors: number; rate: number } {
+    let calls = 0;
+    let errors = 0;
+    for (const r of this.recentResults) {
+      if (r.tool !== toolName) continue;
+      calls++;
+      if (r.error) errors++;
+    }
+    return { calls, errors, rate: calls ? errors / calls : 0 };
+  }
+
+  private evictSigs(): void {
+    if (this.opts.timeWindowMs > 0) {
+      const cutoff = Date.now() - this.opts.timeWindowMs;
+      this.recentSigs = this.recentSigs.filter((s) => s.ts >= cutoff);
+    }
+    while (this.recentSigs.length > this.opts.windowSize) this.recentSigs.shift();
+  }
+
+  private evictResults(): void {
+    if (this.opts.timeWindowMs > 0) {
+      const cutoff = Date.now() - this.opts.timeWindowMs;
+      this.recentResults = this.recentResults.filter((r) => r.ts >= cutoff);
+    }
+    while (this.recentResults.length > this.opts.windowSize) this.recentResults.shift();
+  }
+
+  private evictTexts(): void {
+    if (this.opts.timeWindowMs > 0) {
+      const cutoff = Date.now() - this.opts.timeWindowMs;
+      this.recentTexts = this.recentTexts.filter((t) => t.ts >= cutoff);
+    }
+    while (this.recentTexts.length > this.opts.windowSize) this.recentTexts.shift();
+  }
+
+  /** Estimated tokens burned on redundant repeats (feature B). */
+  wastedTokensCount(): number {
+    return this.wastedTokens;
+  }
+
+  /** Human-readable window introspection for /loopcheck (feature F). */
+  diagnostics(): string {
+    const sigCounts = new Map<string, number>();
+    for (const s of this.recentSigs) sigCounts.set(s.sig, (sigCounts.get(s.sig) ?? 0) + 1);
+    const topSigs = [...sigCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([s, n]) => `${truncate(s, 40)} x${n}`)
+      .join(", ");
+
+    const textCounts = new Map<string, number>();
+    for (const t of this.recentTexts) textCounts.set(t.text, (textCounts.get(t.text) ?? 0) + 1);
+    const topTexts = [...textCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([s, n]) => `"${truncate(s, 24)}" x${n}`)
+      .join(", ");
+
+    return (
+      `calls[${this.recentSigs.length}] ${topSigs || "none"}; ` +
+      `texts[${this.recentTexts.length}] ${topTexts || "none"}; ` +
+      `wastedTokens=${this.wastedTokens}`
+    );
+  }
+
   reset(): void {
     this.recentSigs = [];
     this.recentResults = [];
@@ -210,7 +344,7 @@ export class LoopDetector {
     this.recentTexts = [];
     this.lastText = null;
     this.textStreak = 0;
-    this.textFired = false;
+    this.wastedTokens = 0;
   }
 
   summary(): string {
@@ -235,6 +369,26 @@ export const MIN_REPEAT_CHUNK = 16;
 
 /** Jaccard similarity threshold for "near-identical" consecutive texts. */
 export const TEXT_SIMILARITY_THRESHOLD = 0.55;
+
+/** Stable string form of an arbitrary tool input (used for token estimation). */
+export function stringify(input: unknown): string {
+  if (typeof input === "string") return input;
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return String(input);
+  }
+}
+
+/**
+ * Rough token estimate for cost accounting (feature B): ~4 chars per token,
+ * like the widely-used wc/4 rule. Purposely crude — it only needs to be
+ * monotonic so the same work always reports the same order of magnitude.
+ */
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  return Math.max(1, Math.ceil(text.length / 4));
+}
 
 /**
  * Token-set Jaccard similarity of two texts (case/whitespace-insensitive).
@@ -289,6 +443,10 @@ if (import.meta.main) {
     failThreshold: 3,
     windowSize: 10,
     textRepeatThreshold: 3,
+    timeWindowMs: 0,
+    failRateThreshold: 0,
+    failRateMinCalls: 3,
+    toolExclude: new Set(),
   };
   const d: LoopDetector = new LoopDetector(opts);
 

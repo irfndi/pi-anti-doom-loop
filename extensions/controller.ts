@@ -151,10 +151,13 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
     status() {
       const o = detector.opts;
       const s = suspended ? ", suspended" : "";
+      const rate = o.failRateThreshold > 0 ? `, failRate>=${o.failRateThreshold}` : "";
+      const time = o.timeWindowMs > 0 ? `, window ${o.timeWindowMs}ms` : "";
+      const excl = o.toolExclude.size ? `, exclude[${[...o.toolExclude].join(",")}]` : "";
       return (
         `anti-doom-loop: repeats>=${o.repeatThreshold}/window ${o.windowSize}, ` +
-        `fails>=${o.failThreshold}, text>=${o.textRepeatThreshold}. ${detector.summary()} ` +
-        `steers=${steers} aborts=${aborts}${s}`
+        `fails>=${o.failThreshold}, text>=${o.textRepeatThreshold}${rate}${time}${excl}. ` +
+        `${detector.diagnostics()} steers=${steers} aborts=${aborts}${s}`
       );
     },
   };
