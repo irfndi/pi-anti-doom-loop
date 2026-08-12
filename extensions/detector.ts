@@ -80,6 +80,7 @@ export class LoopDetector {
   private recentSigs: string[] = [];
   private recentResults: { tool: string; error: boolean }[] = [];
   private blockedBySig = new Map<string, number>();
+  private recentTexts: string[] = [];
   private lastText: string | null = null;
   private textStreak = 0;
   private textFired = false;
@@ -156,6 +157,22 @@ export class LoopDetector {
       });
     }
 
+    // Cross-message window repeat: the same text reappearing
+    // textRepeatThreshold times within the recent-text window. Catches text
+    // CYCLES ("Run. GO." / "GO." / "Let me run. GO." …) that never form a
+    // 3-consecutive streak and are too short for repeatedSegment. Mirrors the
+    // tool-signature window in check().
+    const windowCount = this.recentTexts.filter((t) => t === norm).length + 1;
+    this.recentTexts.push(norm);
+    if (this.recentTexts.length > this.opts.windowSize) this.recentTexts.shift();
+    if (windowCount >= this.opts.textRepeatThreshold) {
+      return Result.ok({
+        reason:
+          `Assistant sent identical text ${windowCount} times within the last ${this.opts.windowSize} messages ` +
+          `("${truncate(norm, 80)}"). You appear to be in a loop.`,
+      });
+    }
+
     // Cross-message streak: consecutive assistant texts that are identical
     // OR near-identical (token-overlap similarity). Catches loops where the
     // model slightly rephrases each turn ("inspect the failing test" →
@@ -190,6 +207,7 @@ export class LoopDetector {
     this.recentSigs = [];
     this.recentResults = [];
     this.blockedBySig.clear();
+    this.recentTexts = [];
     this.lastText = null;
     this.textStreak = 0;
     this.textFired = false;
@@ -330,7 +348,7 @@ if (import.meta.main) {
   const textHit = d.checkText("Now update buildProgram.");
   assert.ok(textHit.isOk(), "3rd identical text should fire");
   if (textHit.isOk()) {
-    assert.match(textHit.value.reason, /identical or near-identical text 3 times/);
+    assert.match(textHit.value.reason, /identical text 3 times within the last/);
   }
   assert.ok(
     d.checkText("Now update buildProgram.").isOk(),
@@ -345,23 +363,42 @@ if (import.meta.main) {
   const wsHit = d.checkText(" Read the region: ");
   assert.ok(wsHit.isOk(), "whitespace-normalized repeats should fire");
 
-  // 9. a different message breaks the streak (need 3 consecutive AFTER the break to fire)
+  // 9. window semantics: < textRepeatThreshold recurrences in the window do
+  //    NOT fire, even with other messages interleaved; the 3rd recurrence does.
   d.reset();
   d.checkText("A");
-  d.checkText("A");
-  d.checkText("B"); // breaks the streak
-  d.checkText("A");
-  assert.ok(d.checkText("A").isErr(), "only 2 consecutive As after the break must not fire");
-  const again = d.checkText("A");
-  assert.ok(again.isOk(), "3 consecutive As after the break fire");
+  d.checkText("B"); // different message
+  d.checkText("A"); // 2nd A in window
+  assert.ok(d.checkText("C").isErr(), "2 As in the window must not fire");
+  assert.ok(d.checkText("A").isOk(), "3rd A in the window fires");
 
   // 10. empty/blank text is ignored as a loop signal
   d.reset();
   d.checkText("");
   d.checkText("   ");
   assert.ok(d.checkText("").isErr(), "blank text must not fire");
+  // 11. text CYCLES: a small set of short near-identical commands rotating
+  //     ("Let me run. GO." / "Run. GO." / "GO.") never forms a consecutive
+  //     streak, but the same text reappears >= threshold within the window.
+  d.reset();
+  const cycle = [
+    "Let me run. GO.",
+    "Run. GO.",
+    "GO.",
+    "Run. GO.",
+    "GO.",
+    "Let me run. GO.",
+    "Run. GO.",
+    "GO.",
+    "Run. GO.",
+    "GO.",
+    "Let me run. GO.",
+  ];
+  let fired = false;
+  for (const m of cycle) if (d.checkText(m).isOk()) fired = true;
+  assert.ok(fired, "rotating near-identical cycle must fire");
 
-  // 11. threshold 1 is clamped away (would brick the agent)
+  // 12. threshold 1 is clamped away (would brick the agent)
   const clamped = readOptions({
     PI_ANTI_LOOP_REPEATS: "1",
     PI_ANTI_LOOP_FAILS: "0",

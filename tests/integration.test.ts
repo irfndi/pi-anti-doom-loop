@@ -131,7 +131,7 @@ describe("controller: steer → abort → bounded resume", () => {
     assert.ok(steer, "third identical message must detect");
     assert.equal(steer?.action, "steer", "first detection steers");
     assert.equal(steer?.resume, false);
-    assert.match(steer?.reason ?? "", /near-identical text 3 times/);
+    assert.match(steer?.reason ?? "", /identical text 3 times within the last/);
 
     const abort1 = fire();
     assert.equal(abort1?.action, "abort");

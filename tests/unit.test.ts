@@ -106,7 +106,7 @@ describe("verbatim text detection", () => {
     const hit = d.checkText("Let me fetch the merge ref:");
     assert.ok(hit.isOk());
     if (hit.isOk()) {
-      assert.match(hit.value.reason, /identical or near-identical text 3 times/);
+      assert.match(hit.value.reason, /identical text 3 times within the last/);
     }
     // While the streak holds, every subsequent identical message also fires
     assert.ok(
@@ -128,14 +128,32 @@ describe("verbatim text detection", () => {
     assert.ok(d.checkText(" Read the region: ").isOk());
   });
 
-  it("a different message breaks the streak", () => {
+  it("window semantics: recurrence within the window fires, not just consecutive", () => {
     const d = new LoopDetector(opts);
     d.checkText("A");
-    d.checkText("A");
-    d.checkText("B");
-    d.checkText("A");
-    assert.ok(d.checkText("A").isErr(), "only 2 consecutive As after the break");
-    assert.ok(d.checkText("A").isOk(), "3 consecutive As after the break fire");
+    d.checkText("B"); // different message
+    d.checkText("A"); // 2nd A in window
+    assert.ok(d.checkText("C").isErr(), "2 recurrences in the window must not fire");
+    assert.ok(d.checkText("A").isOk(), "3rd recurrence in the window fires");
+  });
+  it("detects a rotating near-identical command cycle", () => {
+    const d = new LoopDetector(opts);
+    const cycle = [
+      "Let me run. GO.",
+      "Run. GO.",
+      "GO.",
+      "Run. GO.",
+      "GO.",
+      "Let me run. GO.",
+      "Run. GO.",
+      "GO.",
+      "Run. GO.",
+      "GO.",
+      "Let me run. GO.",
+    ];
+    let fired = false;
+    for (const m of cycle) if (d.checkText(m).isOk()) fired = true;
+    assert.ok(fired, "rotating near-identical cycle must fire");
   });
 
   it("blank text is ignored", () => {
