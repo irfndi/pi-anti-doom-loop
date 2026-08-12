@@ -93,7 +93,10 @@ describe("e2e: published artifact", () => {
     // would recursively invoke this test suite.
     const { code, stdout } = await npm(["pack", "--dry-run", "--json", "--ignore-scripts"]);
     assert.equal(code, 0);
-    const files: string[] = JSON.parse(stdout.trim())[0].files.map((f: { path: string }) => f.path);
+    // npm 12 returns an object keyed by package name instead of an array.
+    const parsed = JSON.parse(stdout.trim());
+    const pack = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
+    const files: string[] = pack.files.map((f: { path: string }) => f.path);
     for (const expected of [
       "extensions/index.ts",
       "extensions/controller.ts",
@@ -110,7 +113,10 @@ describe("e2e: published artifact", () => {
   it("test files and review tool state are excluded from the tarball", async () => {
     const { code, stdout } = await npm(["pack", "--dry-run", "--json", "--ignore-scripts"]);
     assert.equal(code, 0);
-    const files: string[] = JSON.parse(stdout.trim())[0].files.map((f: { path: string }) => f.path);
+    // npm 12 returns an object keyed by package name instead of an array.
+    const parsed = JSON.parse(stdout.trim());
+    const pack = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
+    const files: string[] = pack.files.map((f: { path: string }) => f.path);
     assert.ok(
       !files.some((f: string) => f.includes("/tests/") || f.startsWith("tests/")),
       "tests must not ship",
