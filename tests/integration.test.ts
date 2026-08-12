@@ -36,7 +36,7 @@ function makeFakePi() {
     handlers,
     commands,
     sent,
-    fire(event: string, e: any, c: any = {}) {
+    fire: (event: string, e: any, c: any = {}) => {
       const h = handlers.get(event);
       assert.ok(h, `no handler registered for ${event}`);
       return h(e, c);

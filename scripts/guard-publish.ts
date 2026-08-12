@@ -63,8 +63,8 @@ const tagExists = (version: string): Effect.Effect<boolean> =>
         return false; // no git repo / git missing → treat as no tag
       }
     },
-    catch: () => new Error("git tag check failed"),
-  }).pipe(Effect.catch(() => Effect.succeed(false)));
+    catch: (): GuardError => ({ message: "git tag check failed" }),
+  }).pipe(Effect.orElseSucceed(() => false));
 /**
  * Latest published version on npm, or null when the package was never
  * published or the registry is unreachable (warn-only on network failure —
@@ -83,9 +83,9 @@ const fetchPublished = (name: string): Effect.Effect<string | null> =>
       console.warn(
         "GUARD WARN: could not reach the npm registry; skipping published-version check.",
       );
-      return new Error("registry unreachable");
+      return { message: "registry unreachable" };
     },
-  }).pipe(Effect.catch(() => Effect.succeed(null)));
+  }).pipe(Effect.orElseSucceed(() => null));
 
 const program: Effect.Effect<string, GuardError> = Effect.gen(function* () {
   const raw = yield* readManifest;
@@ -94,10 +94,10 @@ const program: Effect.Effect<string, GuardError> = Effect.gen(function* () {
   const expected = (process.argv[2] ?? "").replace(/^v/, ""); // tolerate "v0.0.1"
 
   if (!semverLike(local)) {
-    yield* fail(`GUARD FAIL: package.json version "${local}" is not a semver X.Y.Z.`);
+    return yield* fail(`GUARD FAIL: package.json version "${local}" is not a semver X.Y.Z.`);
   }
   if (expected && expected !== local) {
-    yield* fail(
+    return yield* fail(
       `GUARD FAIL: expected "${expected}" (tag/input) does not match package.json version "${local}". ` +
         `Bump package.json to ${expected}, or tag ${local}.`,
     );
@@ -105,7 +105,7 @@ const program: Effect.Effect<string, GuardError> = Effect.gen(function* () {
 
   const published = yield* fetchPublished(pkg.name);
   if (published === local) {
-    yield* fail(
+    return yield* fail(
       `GUARD FAIL: ${pkg.name}@${local} is already published on npm. ` +
         `Bump the version in package.json to cut a new release.`,
     );
@@ -115,7 +115,7 @@ const program: Effect.Effect<string, GuardError> = Effect.gen(function* () {
   // exist as a git tag — keeps the tag/manifest-sync invariant on both entry
   // points (clawpatch finding).
   if (expected && (yield* tagExists(expected)) === false) {
-    yield* fail(
+    return yield* fail(
       `GUARD FAIL: expected version "${expected}" has no matching git tag v${expected}. Tag it first.`,
     );
   }

@@ -36,7 +36,8 @@
     "guard": "node scripts/guard-publish.ts",
     "lint": "oxlint --deny-warnings",
     "format": "oxfmt .",
-    "format:check": "oxfmt --check ."
+    "format:check": "oxfmt --check .",
+    "prepare": "effect-tsgo patch --no-typescript --oxlint"
   },
   "dependencies": {
     "better-result": "^3.0.0",
@@ -44,9 +45,11 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",
+    "@effect/tsgo": "^0.36.4",
     "@types/node": "^22.0.0",
     "oxfmt": "^0.62.0",
     "oxlint": "^1.77.0",
+    "oxlint-tsgolint": "^7.0.2001",
     "typescript": "^5.6.0"
   },
   "peerDependencies": {
