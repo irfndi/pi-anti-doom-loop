@@ -2,7 +2,14 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
-## [Unreleased]
+## [0.0.7] — 2026-08-13
+
+### Changed
+
+- **Effect 4.0 RC** — upgraded `effect` from `^4.0.0-beta.103` to `^4.0.0-rc.108`.
+- **Anti-slop lint hardening** — vendored an opinionated Oxlint rule set (`tools/oxlint/anti-slop/`) and enabled it in `oxlint.config.ts`; resolved all 23 findings by introducing a JSON-safe `ToolInput` domain type decoded at the pi boundary, replacing `unknown` parameters, `typeof` checks, `Record<string, unknown>`, and value widening.
+
+## [0.0.6] — 2026-08-12
 
 ### Added
 
@@ -97,7 +104,10 @@ All notable changes to **pi-anti-doom-loop**.
 - GitHub Actions release workflow: quality gate → version bump guard → dry-run → publish, triggered by `v*` tags.
 - `pi-package` keyword + `pi` manifest for the pi.dev gallery.
 
+[0.0.7]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.6...v0.0.7
+[0.0.6]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.3...v0.0.4
+[0.0.3]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/irfndi/pi-anti-doom-loop/releases/tag/v0.0.1
