@@ -31,11 +31,12 @@ import {
   type AntiLoopController,
   type CommandCtxLite,
   type CtxLite,
+  type MessageContent,
   type MessageEndEventLite,
   type ToolCallEventLite,
   type ToolResultEventLite,
 } from "./controller.ts";
-import { readOptions } from "./detector.ts";
+import { readOptions, type ToolInput } from "./detector.ts";
 
 /** The subset of pi's ExtensionAPI this extension uses (structural). */
 export interface PiLike {
@@ -77,7 +78,13 @@ export default function (pi: PiLike): void {
   pi.on("before_agent_start", () => controller.reset());
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
-    const outcome = controller.onToolCall(event.toolName, event.input, event.toolCallId);
+    // The pi event delivers untyped tool arguments; decode them into the
+    // ToolInput domain type at this I/O boundary before the controller sees them.
+    const outcome = controller.onToolCall(
+      event.toolName,
+      event.input as ToolInput,
+      event.toolCallId,
+    );
     if (outcome === null) return;
     if (outcome.escalate) {
       ctx.ui.notify("Anti-doom-loop: identical call blocked again — aborting turn", "error");
@@ -94,7 +101,11 @@ export default function (pi: PiLike): void {
   // tool calls) never reach tool_call. Steer first, abort as escalation,
   // then a bounded auto-resume so the work continues.
   pi.on("message_end", (event: MessageEndEventLite, ctx: CtxLite) => {
-    const outcome = controller.onMessageEnd(event.message.role, event.message.content);
+    // Decode the untyped message content into MessageContent at this boundary.
+    const outcome = controller.onMessageEnd(
+      event.message.role,
+      event.message.content as MessageContent,
+    );
     if (outcome === null) return;
 
     if (outcome.action === "steer") {

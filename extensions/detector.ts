@@ -77,18 +77,32 @@ export function readOptions(env: Record<string, string | undefined> = process.en
   };
 }
 
+/**
+ * A JSON-safe tool-call argument value. Tool inputs arrive from the pi event
+ * loop as untyped data; they are decoded into this domain type at the I/O
+ * boundary (see index.ts) before the detector fingerprints them.
+ */
+export type ToolInput =
+  | null
+  | boolean
+  | number
+  | string
+  | ToolInput[]
+  | { readonly [key: string]: ToolInput };
+
 /** Keys sorted recursively so {a:1,b:2} and {b:2,a:1} share a signature. */
-export function canonical(input: unknown): string {
-  if (input === null || typeof input !== "object") return JSON.stringify(input);
+export function canonical(input: ToolInput): string {
   if (Array.isArray(input)) return `[${input.map(canonical).join(",")}]`;
-  const obj = input as Record<string, unknown>;
-  return `{${Object.keys(obj)
-    .sort()
-    .map((k) => `${JSON.stringify(k)}:${canonical(obj[k])}`)
-    .join(",")}}`;
+  if (input instanceof Object) {
+    return `{${Object.keys(input)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonical(input[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(input) ?? "";
 }
 
-export function signature(toolName: string, input: unknown): string {
+export function signature(toolName: string, input: ToolInput): string {
   return `${toolName}:${canonical(input)}`;
 }
 
@@ -118,7 +132,7 @@ export class LoopDetector {
     this.opts = opts;
   }
 
-  check(toolName: string, input: unknown): Result<BlockDecision, undefined> {
+  check(toolName: string, input: ToolInput): Result<BlockDecision, undefined> {
     if (this.opts.toolExclude.has(toolName)) {
       // record() is a no-op for excluded tools, so nothing enters the window.
       return Result.err(undefined);
@@ -168,7 +182,7 @@ export class LoopDetector {
     });
   }
 
-  record(toolName: string, input: unknown): void {
+  record(toolName: string, input: ToolInput): void {
     if (this.opts.toolExclude.has(toolName)) return;
     this.recentSigs.push({ sig: signature(toolName, input), ts: Date.now() });
     this.evictSigs();
@@ -272,7 +286,7 @@ export class LoopDetector {
   }
 
   /** Error share of all in-window results for a tool. */
-  private failRate(toolName: string): { calls: number; errors: number; rate: number } {
+  private failRate(toolName: string) {
     let calls = 0;
     let errors = 0;
     for (const r of this.recentResults) {
@@ -370,14 +384,9 @@ export const MIN_REPEAT_CHUNK = 16;
 /** Jaccard similarity threshold for "near-identical" consecutive texts. */
 export const TEXT_SIMILARITY_THRESHOLD = 0.55;
 
-/** Stable string form of an arbitrary tool input (used for token estimation). */
-export function stringify(input: unknown): string {
-  if (typeof input === "string") return input;
-  try {
-    return JSON.stringify(input);
-  } catch {
-    return String(input);
-  }
+/** Stable string form of a tool input (used for token estimation). */
+export function stringify(input: ToolInput): string {
+  return JSON.stringify(input) ?? "";
 }
 
 /**

@@ -1,3 +1,17 @@
+import type { ToolInput } from "../extensions/detector.ts";
+
+/** One tool call in a fixture transcript, with JSON tool args. */
+export interface FixtureCall {
+  tool: string;
+  args: ToolInput;
+}
+
+/** A named fixture transcript of repeated tool calls. */
+export interface CallFixture {
+  name: string;
+  calls: FixtureCall[];
+}
+
 /**
  * Real-world doom-loop captures (fixtures).
  *
@@ -71,7 +85,7 @@ export const regexRepeatLoop = {
 };
 
 /** Repeated identical tool calls from the CI-log investigation. */
-export const toolLoopGhRunView = {
+export const toolLoopGhRunView: CallFixture = {
   name: "repeated identical `gh run view --log` calls",
   calls: [
     { tool: "bash", args: { command: "gh run view 30995002816 --log > /tmp/run30995002816.log" } },
@@ -82,7 +96,7 @@ export const toolLoopGhRunView = {
   ],
 };
 
-export const toolLoopGrepSameFile = {
+export const toolLoopGrepSameFile: CallFixture = {
   name: "repeated identical `grep` on the same file",
   calls: [
     { tool: "grep", args: { pattern: "legacy schema", path: "real-money-readiness.test.ts" } },
@@ -93,7 +107,7 @@ export const toolLoopGrepSameFile = {
 };
 
 /** A healthy session: varied reads + edits with progress — must NOT flag. */
-export const healthySession = {
+export const healthySession: CallFixture = {
   name: "healthy multi-step session (no loop)",
   calls: [
     { tool: "read", args: { path: "src/a.ts" } },

@@ -9,7 +9,12 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { LoopDetector, canonical, type LoopOptions } from "../extensions/detector.ts";
+import {
+  LoopDetector,
+  canonical,
+  type LoopOptions,
+  type ToolInput,
+} from "../extensions/detector.ts";
 
 /** mulberry32 — tiny deterministic PRNG. */
 function rng(seed: number): () => number {
@@ -35,7 +40,7 @@ const PATHS = [
 ];
 const TOOLS = ["read", "grep", "bash", "edit", "write", "ls"];
 
-function randomArgs(rand: () => number): Record<string, unknown> {
+function randomArgs(rand: () => number): ToolInput {
   const kind = Math.floor(rand() * 6);
   switch (kind) {
     case 0:
@@ -59,6 +64,11 @@ function randomArgs(rand: () => number): Record<string, unknown> {
     default:
       return { empty: true, id: Math.floor(rand() * 1_000_000_000) }; // discriminator keeps it unique
   }
+}
+
+/** Stamp a per-call unique `_seq` onto fuzzed args so calls never repeat. */
+function withSeq(base: ToolInput, seq: number): ToolInput {
+  return { ...(base as Record<string, ToolInput>), _seq: seq };
 }
 
 const opts: LoopOptions = {
@@ -110,7 +120,7 @@ describe("fuzz: no false positives on random streams", () => {
         const tool = TOOLS[Math.floor(rand() * TOOLS.length)];
         // Unique _seq per call: guarantees non-repeating traffic, so any
         // block would be a false positive.
-        const args = { ...randomArgs(rand), _seq: run * 1000 + i };
+        const args = withSeq(randomArgs(rand), run * 1000 + i);
         if (d.check(tool, args).isOk()) blocked++;
         d.record(tool, args);
       }
@@ -127,14 +137,14 @@ describe("fuzz: any stream with N identical calls must block", () => {
       const loopCall = { command: "gh run view 30995002816 --log" };
       // Deterministic: the first 3 calls are the loop (guaranteed block
       // within the window), then random traffic.
-      const sequence: Array<{ tool: string; args: unknown }> = [
+      const sequence: Array<{ tool: string; args: ToolInput }> = [
         { tool: "bash", args: loopCall },
         { tool: "bash", args: loopCall },
         { tool: "bash", args: loopCall },
       ];
       for (let i = 0; i < 50; i++) {
         const tool = TOOLS[Math.floor(rand() * TOOLS.length)];
-        sequence.push({ tool, args: { ...randomArgs(rand), _seq: i } });
+        sequence.push({ tool, args: withSeq(randomArgs(rand), i) });
       }
       let blocked = false;
       for (const call of sequence) {
@@ -161,14 +171,14 @@ describe("fuzz: any stream with N identical calls must block", () => {
     for (let run = 0; run < 20; run++) {
       const d = new LoopDetector(opts);
       const loopCall = { command: `gh run view ${run} --log` };
-      const sequence: Array<{ tool: string; args: unknown }> = [
+      const sequence: Array<{ tool: string; args: ToolInput }> = [
         { tool: "bash", args: loopCall },
         { tool: "bash", args: loopCall },
         { tool: "bash", args: loopCall },
       ];
       for (let i = 0; i < 30; i++) {
         const tool = TOOLS[Math.floor(rand() * TOOLS.length)];
-        sequence.push({ tool, args: { ...randomArgs(rand), _seq: i } });
+        sequence.push({ tool, args: withSeq(randomArgs(rand), i) });
       }
       let blocked = false;
       for (const call of sequence) {
@@ -257,12 +267,12 @@ describe("fuzz: canonical stability", () => {
     assert.doesNotThrow(() => d.check("grep", { pattern: "", path: "" }));
     assert.doesNotThrow(() => d.check("read", { depth: 100, nested: buildDeep(100) }));
     assert.doesNotThrow(() => d.checkText("x".repeat(200_000)));
-    assert.doesNotThrow(() => canonical([null, undefined, true, false, 0, -1, 3.14, "", "a"]));
+    assert.doesNotThrow(() => canonical([null, true, false, 0, -1, 3.14, "", "a"]));
   });
 });
 
-function buildDeep(depth: number): unknown {
-  let o: unknown = "leaf";
+function buildDeep(depth: number): ToolInput {
+  let o: ToolInput = "leaf";
   for (let i = 0; i < depth; i++) o = { child: o };
   return o;
 }

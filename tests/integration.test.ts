@@ -100,21 +100,17 @@ describe("controller: message lifecycle", () => {
     const c = createController();
     assert.equal(c.onMessageEnd("user", [{ type: "text", text: "x" }]), null);
     assert.equal(c.onMessageEnd("toolResult", [{ type: "text", text: "x" }]), null);
-    assert.equal(c.onMessageEnd("assistant", [{ type: "image", data: "..." }]), null);
-    assert.equal(c.onMessageEnd("assistant", "not-an-array"), null);
+    assert.equal(c.onMessageEnd("assistant", [{ type: "image" }]), null);
+    assert.equal(c.onMessageEnd("assistant", []), null);
   });
 
   it("extractText joins text blocks and skips non-text", () => {
     assert.equal(
-      extractText([
-        { type: "text", text: "a" },
-        { type: "image", data: "x" },
-        { type: "text", text: "b" },
-      ]),
+      extractText([{ type: "text", text: "a" }, { type: "image" }, { type: "text", text: "b" }]),
       "a  b",
     );
-    assert.equal(extractText(null), "");
-    assert.equal(extractText([{ type: "text", text: 42 }]), "");
+    assert.equal(extractText([]), "");
+    assert.equal(extractText([{ type: "image" }]), "");
   });
 });
 

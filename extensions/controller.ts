@@ -13,7 +13,7 @@
  * a fresh session (new controller) starts over.
  */
 import { LoopDetector, readOptions } from "./detector.ts";
-import type { LoopOptions } from "./detector.ts";
+import type { LoopOptions, ToolInput } from "./detector.ts";
 
 /** Minimal shapes of the pi events the controller consumes (structural). */
 export interface ToolCallEventLite {
@@ -37,6 +37,15 @@ export interface CommandCtxLite {
   ui: { notify(message: string, level: string): void };
 }
 
+/** One content block of an assistant message; only text blocks carry text. */
+export interface MessageContentBlock {
+  readonly type: string;
+  readonly text?: string;
+}
+
+/** The list of content blocks of an assistant message. */
+export type MessageContent = readonly MessageContentBlock[];
+
 export interface ToolCallOutcome {
   block: true;
   reason: string;
@@ -56,11 +65,11 @@ export const RESUME_BUDGET = 1;
 
 export interface AntiLoopController {
   /** Returns a block decision for a tool call, or null to let it run. */
-  onToolCall(toolName: string, input: unknown, toolCallId: string): ToolCallOutcome | null;
+  onToolCall(toolName: string, input: ToolInput, toolCallId: string): ToolCallOutcome | null;
   /** Record a finished tool result (blocked calls' results are ignored). */
   onToolResult(toolName: string, toolCallId: string, isError: boolean): void;
   /** Detect assistant-text loops; returns a steer/abort decision or null. */
-  onMessageEnd(role: string, content: unknown): TextLoopOutcome | null;
+  onMessageEnd(role: string, content: MessageContent): TextLoopOutcome | null;
   /** Full reset (session start, user prompt, /loopcheck reset). */
   reset(): void;
   /** Suspend detection until the next reset (escape hatch for intentional repetition). */
@@ -164,13 +173,6 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
 }
 
 /** Join the text content blocks of an assistant message. */
-export function extractText(content: unknown): string {
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((c) =>
-      typeof c === "object" && c !== null && c.type === "text" && typeof c.text === "string"
-        ? c.text
-        : "",
-    )
-    .join(" ");
+export function extractText(content: MessageContent): string {
+  return content.map((c) => (c.type === "text" ? (c.text ?? "") : "")).join(" ");
 }
