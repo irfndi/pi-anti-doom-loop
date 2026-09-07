@@ -35,14 +35,31 @@ const readManifest: Effect.Effect<string, GuardError> = Effect.tryPromise({
   catch: () => ({ message: "GUARD FAIL: could not read package.json" }),
 });
 
+/** True when an unknown JSON value has the manifest shape this guard needs. */
+const isManifest = (value: unknown): value is Manifest => {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("name" in value) || !("version" in value)) return false;
+  return typeof value.name === "string" && typeof value.version === "string";
+};
+
+/** True when an unknown JSON value carries a string version field. */
+const hasStringVersion = (value: unknown): value is { version: string } => {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("version" in value)) return false;
+  return typeof value.version === "string";
+};
+
 const parseManifest = (raw: string): Effect.Effect<Manifest, GuardError> => {
-  let manifest: Manifest;
+  let parsed: unknown;
   try {
-    manifest = JSON.parse(raw) as Manifest;
+    parsed = JSON.parse(raw);
   } catch {
     return Effect.fail({ message: "GUARD FAIL: package.json is not valid JSON" });
   }
-  return Effect.succeed(manifest);
+  if (!isManifest(parsed)) {
+    return Effect.fail({ message: "GUARD FAIL: package.json has no string name and version" });
+  }
+  return Effect.succeed(parsed);
 };
 const semverLike = (value: string): boolean => /^\d+\.\d+\.\d+$/.test(value);
 
@@ -77,7 +94,8 @@ const fetchPublished = (name: string): Effect.Effect<string | null> =>
         headers: { accept: "application/json" },
       });
       if (!res.ok) return null;
-      return ((await res.json()) as { version?: string }).version ?? null;
+      const body: unknown = await res.json();
+      return hasStringVersion(body) ? body.version : null;
     },
     catch: () => {
       console.warn(

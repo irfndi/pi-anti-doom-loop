@@ -38,9 +38,18 @@ import {
 } from "./controller.ts";
 import { readOptions, type ToolInput } from "./detector.ts";
 
+/** What an event handler hands back to pi: a tool-call block decision, or nothing.
+ * Mirrors pi's own `ExtensionHandler<E, R>` contract (`Promise<R | void> | R | void`)
+ * narrowed to this extension's result; handlers stay synchronous here.
+ */
+export type PiHandlerResult = { block: true; reason: string } | undefined;
+
 /** The subset of pi's ExtensionAPI this extension uses (structural). */
 export interface PiLike {
-  on<E = unknown, C = unknown>(event: string, handler: (event: E, ctx: C) => unknown): void;
+  on<E = unknown, C = unknown>(
+    event: string,
+    handler: (event: E, ctx: C) => PiHandlerResult | void,
+  ): void;
   registerCommand(
     name: string,
     opts: {
@@ -78,8 +87,8 @@ export default function (pi: PiLike): void {
   pi.on("before_agent_start", () => controller.reset());
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
-    // The pi event delivers untyped tool arguments; decode them into the
-    // ToolInput domain type at this I/O boundary before the controller sees them.
+    // SAFETY: pi delivers JSON-safe tool arguments, which is exactly the ToolInput domain.
+    // Decode them into the ToolInput domain type at this I/O boundary before the controller sees them.
     const outcome = controller.onToolCall(
       event.toolName,
       event.input as ToolInput,
@@ -101,6 +110,7 @@ export default function (pi: PiLike): void {
   // tool calls) never reach tool_call. Steer first, abort as escalation,
   // then a bounded auto-resume so the work continues.
   pi.on("message_end", (event: MessageEndEventLite, ctx: CtxLite) => {
+    // SAFETY: pi delivers message content as JSON-safe blocks matching MessageContent.
     // Decode the untyped message content into MessageContent at this boundary.
     const outcome = controller.onMessageEnd(
       event.message.role,

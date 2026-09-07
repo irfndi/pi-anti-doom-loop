@@ -11,13 +11,14 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createController, extractText } from "../extensions/controller.ts";
 import indexDefault from "../extensions/index.ts";
-import type { PiLike } from "../extensions/index.ts";
+import type { PiLike, PiHandlerResult } from "../extensions/index.ts";
+import type { CommandCtxLite } from "../extensions/controller.ts";
 
 function makeFakePi() {
-  const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+  const handlers = new Map<string, (event: any, ctx: any) => PiHandlerResult | void>();
   const commands = new Map<
     string,
-    { description?: string; handler: (args: string, ctx: any) => unknown }
+    { description?: string; handler: (args: string, ctx: CommandCtxLite) => Promise<void> | void }
   >();
   const sent: Array<{ content: any; options?: any }> = [];
   const pi: PiLike = {
@@ -100,7 +101,7 @@ describe("controller: message lifecycle", () => {
     const c = createController();
     const spam = (n: number, command = "true") =>
       Array.from({ length: n }, () => ({ type: "toolCall", name: "bash", arguments: { command } }));
-    const hit = c.onMessageEnd("assistant", spam(3) as any);
+    const hit = c.onMessageEnd("assistant", spam(3));
     assert.ok(hit !== null && hit.action === "abort" && !hit.resume);
     assert.match(hit!.reason, /identical "bash" calls/);
   });
@@ -112,12 +113,12 @@ describe("controller: message lifecycle", () => {
       { type: "toolCall", name: "read", arguments: { path: "b.ts" } },
       { type: "toolCall", name: "bash", arguments: { command: "npm test" } },
     ];
-    assert.equal(c.onMessageEnd("assistant", distinct as any), null);
+    assert.equal(c.onMessageEnd("assistant", distinct), null);
     const two = [
       { type: "toolCall", name: "bash", arguments: { command: "true" } },
       { type: "toolCall", name: "bash", arguments: { command: "true" } },
     ];
-    assert.equal(c.onMessageEnd("assistant", two as any), null);
+    assert.equal(c.onMessageEnd("assistant", two), null);
   });
 
   it("ignores non-assistant roles and non-text content", () => {
@@ -286,7 +287,7 @@ describe("index.ts adapter (fake PiLike)", () => {
       "tool_call",
       { toolName: "bash", toolCallId: "3", input: { command: "grep foo" } },
       withAbort,
-    ) as { block: true; reason: string } | undefined;
+    );
     assert.ok(r, "third identical call must be blocked");
     if (r) {
       assert.equal(r.block, true);
@@ -299,7 +300,7 @@ describe("index.ts adapter (fake PiLike)", () => {
       "tool_call",
       { toolName: "bash", toolCallId: "4", input: { command: "grep foo" } },
       withAbort,
-    ) as { block: true; reason: string } | undefined;
+    );
     assert.ok(r2 && r2.block === true, "re-issue is still blocked");
     assert.equal(aborts.length, 1, "escalation aborts the turn");
   });
@@ -356,17 +357,17 @@ describe("index.ts adapter (fake PiLike)", () => {
     const notices: string[] = [];
     const ctx = { ui: { notify: (m: string) => notices.push(m) } };
 
-    await cmd!.handler("", ctx as any);
+    await cmd!.handler("", ctx);
     assert.match(notices[0], /anti-doom-loop: repeats>=3/);
     assert.match(notices[0], /steers=0 aborts=0/);
 
-    await cmd!.handler("suspend", ctx as any);
+    await cmd!.handler("suspend", ctx);
     assert.match(notices[1], /suspended/);
 
-    await cmd!.handler("resume", ctx as any);
+    await cmd!.handler("resume", ctx);
     assert.match(notices[2], /resumed/);
 
-    await cmd!.handler("reset", ctx as any);
+    await cmd!.handler("reset", ctx);
     assert.match(notices[3], /counters reset/);
   });
 });

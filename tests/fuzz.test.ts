@@ -68,6 +68,7 @@ function randomArgs(rand: () => number): ToolInput {
 
 /** Stamp a per-call unique `_seq` onto fuzzed args so calls never repeat. */
 function withSeq(base: ToolInput, seq: number): ToolInput {
+  // SAFETY: randomArgs only produces object shapes, so spreading stamps _seq onto an object.
   return { ...(base as Record<string, ToolInput>), _seq: seq };
 }
 

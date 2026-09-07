@@ -113,6 +113,35 @@ export interface BlockDecision {
   escalate: boolean;
 }
 
+/** Block reasons for one tool call: identical repeats, failure streak, failure rate. */
+function collectBlockReasons(
+  toolName: string,
+  total: number,
+  consecutiveFails: number,
+  rate: { calls: number; errors: number; rate: number },
+  opts: LoopOptions,
+): string[] {
+  const reasons: string[] = [];
+  if (total >= opts.repeatThreshold) {
+    reasons.push(
+      `"${toolName}" was called with identical arguments ${total} times in the last ${opts.windowSize} tool calls with no change`,
+    );
+  }
+  if (consecutiveFails >= opts.failThreshold) {
+    reasons.push(`"${toolName}" failed ${consecutiveFails} consecutive times`);
+  }
+  if (
+    opts.failRateThreshold > 0 &&
+    rate.calls >= opts.failRateMinCalls &&
+    rate.rate >= opts.failRateThreshold
+  ) {
+    reasons.push(
+      `"${toolName}" failed ${rate.errors} of ${rate.calls} calls in the window (${Math.round(rate.rate * 100)}%)`,
+    );
+  }
+  return reasons;
+}
+
 /**
  * Call `check` in `tool_call` (before executing). If it returns a decision,
  * block the call. Call `record` only for calls that were NOT blocked, and
@@ -141,31 +170,18 @@ export class LoopDetector {
     const sig = signature(toolName, input);
     const repeats = this.recentSigs.filter((s) => s.sig === sig).length;
     const total = repeats + 1; // including this call
-    const consecutiveFails = this.consecutiveFails(toolName);
-    const rate = this.failRate(toolName);
 
     // Rough cost accounting (feature B): every redundant repeat of an already
     // present signature burns tokens with no new information.
     if (repeats >= 1) this.wastedTokens += estimateTokens(stringify(input));
 
-    const reasons: string[] = [];
-    if (total >= this.opts.repeatThreshold) {
-      reasons.push(
-        `"${toolName}" was called with identical arguments ${total} times in the last ${this.opts.windowSize} tool calls with no change`,
-      );
-    }
-    if (consecutiveFails >= this.opts.failThreshold) {
-      reasons.push(`"${toolName}" failed ${consecutiveFails} consecutive times`);
-    }
-    if (
-      this.opts.failRateThreshold > 0 &&
-      rate.calls >= this.opts.failRateMinCalls &&
-      rate.rate >= this.opts.failRateThreshold
-    ) {
-      reasons.push(
-        `"${toolName}" failed ${rate.errors} of ${rate.calls} calls in the window (${Math.round(rate.rate * 100)}%)`,
-      );
-    }
+    const reasons = collectBlockReasons(
+      toolName,
+      total,
+      this.consecutiveFails(toolName),
+      this.failRate(toolName),
+      this.opts,
+    );
 
     if (reasons.length === 0) return Result.err(undefined);
 
@@ -456,15 +472,20 @@ export function tokenSimilarity(a: string, b: string): number {
  * within a single normalized message, or null.
  *
  * Catches growing doom loops where the model self-concatenates the same
- * sentence ("…X:…X:…X") — the pattern that evaded cross-message verbatim
+ * sentence ("…X…X…X") — the pattern that evaded cross-message verbatim
  * detection in production (each message differs, so no streak forms).
  * Short segments (< MIN_REPEAT_CHUNK) are ignored so pasted logs with
  * repeated one-word lines never false-positive.
+ *
+ * ':' is deliberately NOT a sentence boundary: status lists like
+ * "worker dispatched: a. worker dispatched: b. worker dispatched: c."
+ * must stay whole so distinct sentences never count as repeats.
+ * Separator-less concatenation ("S:S:S:") is caught by tandemPrefix instead.
  */
 export function repeatedSegment(normalized: string, threshold: number): string | null {
   const segments = normalized
-    .split(/(?<=[.:!?])\s*/)
-    .map((s) => s.trim().replace(/[.:!?]+$/, ""))
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim().replace(/[.!?]+$/, ""))
     .filter((s) => s.length >= MIN_REPEAT_CHUNK);
   const counts = new Map<string, number>();
   for (const seg of segments) {
@@ -472,7 +493,45 @@ export function repeatedSegment(normalized: string, threshold: number): string |
     if (n >= threshold) return seg;
     counts.set(seg, n);
   }
+  return tandemPrefix(normalized, threshold);
+}
+
+/** Messages longer than this are pasted logs, not loop utterances — skip. */
+const TANDEM_MAX_LEN = 2000;
+/** Longest repeated block worth scanning (real loop sentences are < 200 chars). */
+const TANDEM_MAX_CHUNK = 500;
+
+/**
+ * Whole-message consecutive repetition anchored at the start ("S:S:S:",
+ * "S: S: S:", regex fragments "X X X"). Returns the stripped block or null.
+ * Skips long inputs (pasted logs) and pure-separator blocks.
+ */
+export function tandemPrefix(normalized: string, threshold: number): string | null {
+  if (normalized.length < MIN_REPEAT_CHUNK * threshold) return null;
+  if (normalized.length > TANDEM_MAX_LEN) return null;
+  const padded = normalized.endsWith(" ") ? normalized : `${normalized} `;
+  const maxL = Math.min(TANDEM_MAX_CHUNK, Math.floor((padded.length - 1) / (threshold - 1)));
+  for (let len = MIN_REPEAT_CHUNK; len <= maxL; len++) {
+    const first = stripBlock(padded.slice(0, len));
+    if (first.length < MIN_REPEAT_CHUNK) continue;
+    let ok = true;
+    for (let k = 1; k < threshold; k++) {
+      if (stripBlock(padded.slice(k * len, (k + 1) * len)) !== first) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return first;
+  }
   return null;
+}
+
+/** Compare blocks ignoring trailing separators so "X:" and "X" unify. */
+function stripBlock(block: string): string {
+  return block
+    .trim()
+    .replace(/[.:!?\s]+$/, "")
+    .trim();
 }
 
 // --- self-check (runs under `node extensions/detector.ts`, skipped when loaded by pi) ---
@@ -612,7 +671,7 @@ if (import.meta.main) {
   const spamHit = d.checkDuplicateCalls(
     Array.from({ length: 3 }, () => ({
       toolName: "bash",
-      input: { command: "true" } as ToolInput,
+      input: { command: "true" } satisfies ToolInput,
     })),
   );
   assert.ok(spamHit.isOk(), "3 identical calls in one message should fire");

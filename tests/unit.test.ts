@@ -310,6 +310,18 @@ describe("within-message self-repetition (repeatedSegment)", () => {
     const msg = "Open the file. Read the tests. Run the suite. Check the output.";
     assert.equal(repeatedSegment(msg, 3), null);
   });
+
+  it("does not fire on status lists with a repeated prefix and distinct values", () => {
+    const msg =
+      "worker dispatched: api-reviewer. worker dispatched: frontend. worker dispatched: backend.";
+    assert.equal(repeatedSegment(normalizeText(msg), 3), null);
+  });
+
+  it("does not fire on exclamation-separated status updates", () => {
+    const msg =
+      "worker dispatched for api! worker dispatched for frontend! worker dispatched for backend!";
+    assert.equal(repeatedSegment(normalizeText(msg), 3), null);
+  });
 });
 
 describe("within-message detection through checkText", () => {
@@ -332,6 +344,14 @@ describe("within-message detection through checkText", () => {
     const d = new LoopDetector(opts);
     const hit = d.checkText("Let me view the failing test context in the CI log:".repeat(3));
     assert.ok(hit.isOk(), "first message with 3 repeats fires immediately");
+  });
+
+  it("does not steer on dispatcher status updates listing distinct workers", () => {
+    const d = new LoopDetector(opts);
+    const hit = d.checkText(
+      "worker dispatched: api-reviewer. worker dispatched: frontend. worker dispatched: backend.",
+    );
+    assert.ok(hit.isErr(), "distinct status list must not steer");
   });
 });
 

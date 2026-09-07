@@ -2,6 +2,18 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.0.9] — 2026-09-07
+
+### Added
+
+- **Full anti-slop rule set** — synced the vendored Oxlint plugin with upstream: 5 missing generic rules (`no-module-mocking`, `no-reflect-apply`, `no-reflect-get`, `no-unknown-returns`, `require-safety-comment-for-type-assertion`), the opt-in Effect plugin (`no-service-constructor-imports`, enabled — this repo declares `effect`), and the supporting shared helpers. All 15 generic rules plus the Effect rule run at `error`.
+- **Complexity gate** — `eslint/complexity` with `{ max: 10 }`; anything in the 11+ "refactor now" band fails the build.
+
+### Fixed
+
+- **Within-message false positive on status lists** — `repeatedSegment` no longer splits on `:` (status updates like "worker dispatched: a. worker dispatched: b. worker dispatched: c." stay whole and distinct). Separator-less concatenation (`S:S:S:`) and truncated repeats are still caught by the new `tandemPrefix` check.
+- **Complexity + slop findings in owned code** — extracted `collectBlockReasons` (`check` CC 11 → 6); replaced `as` casts at I/O boundaries with `SAFETY:` invariants, real `isManifest` / `hasStringVersion` guards, a named `PiHandlerResult` contract, and assertion-free tests.
+
 ## [0.0.8] — 2026-08-24
 
 ### Added

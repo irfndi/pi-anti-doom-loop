@@ -122,6 +122,7 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       // Within-message duplicate tool-call spam fires first: it aborts (the
       // calls are already emitted, steering cannot retract them), so it must
       // outrank the steer-able text ladder.
+      // SAFETY: tool-call arguments arrive as JSON-safe values matching ToolInput.
       const calls = content
         .filter((c) => c.type === "toolCall")
         .map((c) => ({ toolName: c.name ?? "", input: c.arguments as ToolInput }));
