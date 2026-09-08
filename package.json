@@ -37,7 +37,7 @@
     "lint": "oxlint --deny-warnings",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
-    "prepare": "effect-tsgo patch --no-typescript --oxlint"
+    "prepare": "effect-tsgo patch --no-typescript --oxlint --skip-missing"
   },
   "dependencies": {
     "better-result": "^3.0.0",
