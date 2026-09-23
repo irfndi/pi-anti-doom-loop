@@ -102,6 +102,12 @@ export function canonical(input: ToolInput): string {
   return JSON.stringify(input) ?? "";
 }
 
+/**
+ * Callers pass detector-visible input: hosts strip harness-internal fields
+ * (omp removes the intent label `i` at parse via `extractIntent`) before the
+ * `tool_call` event, so identity is the executed args exactly as the detector
+ * receives them.
+ */
 export function signature(toolName: string, input: ToolInput): string {
   return `${toolName}:${canonical(input)}`;
 }
@@ -149,7 +155,7 @@ function collectBlockReasons(
  */
 export class LoopDetector {
   readonly opts: LoopOptions;
-  private recentSigs: { sig: string; ts: number }[] = [];
+  private recentSigs: { sig: string; tool: string; args: string; ts: number }[] = [];
   private recentResults: { tool: string; error: boolean; ts: number }[] = [];
   private blockedBySig = new Map<string, number>();
   private recentTexts: { text: string; ts: number }[] = [];
@@ -167,7 +173,8 @@ export class LoopDetector {
       return Result.err(undefined);
     }
     this.evictSigs();
-    const sig = signature(toolName, input);
+    const args = canonical(input);
+    const sig = `${toolName}:${args}`;
     const repeats = this.recentSigs.filter((s) => s.sig === sig).length;
     const total = repeats + 1; // including this call
 
@@ -182,6 +189,21 @@ export class LoopDetector {
       this.failRate(toolName),
       this.opts,
     );
+
+    // Exact-signature miss: a loop that varies cosmetic fields (the `i` intent
+    // label, tail flags, timeouts) never repeats a signature. Production data:
+    // 7 of 9 commands repeated ≥3× in a live session had fully distinct args
+    // with an identical `command`. Same tool + ≥55% shared arg tokens still
+    // counts as a repeat.
+    if (reasons.length === 0) {
+      const near = this.nearRepeats(toolName, args);
+      if (near >= 1) this.wastedTokens += estimateTokens(stringify(input));
+      if (near + 1 >= this.opts.repeatThreshold) {
+        reasons.push(
+          `"${toolName}" was called with near-identical arguments ${near + 1} times in the last ${this.opts.windowSize} tool calls (only minor changes)`,
+        );
+      }
+    }
 
     if (reasons.length === 0) return Result.err(undefined);
 
@@ -200,8 +222,20 @@ export class LoopDetector {
 
   record(toolName: string, input: ToolInput): void {
     if (this.opts.toolExclude.has(toolName)) return;
-    this.recentSigs.push({ sig: signature(toolName, input), ts: Date.now() });
+    const args = canonical(input);
+    this.recentSigs.push({ sig: `${toolName}:${args}`, tool: toolName, args, ts: Date.now() });
     this.evictSigs();
+  }
+
+  /** Windowed same-tool entries whose args are ≥55% shared tokens (identical counts). */
+  private nearRepeats(toolName: string, args: string): number {
+    let n = 0;
+    for (const s of this.recentSigs) {
+      if (s.tool !== toolName) continue;
+      const sim = argSimilarity(args, s.args);
+      if (sim !== null && sim >= NEAR_ARGS_SIMILARITY_THRESHOLD) n++;
+    }
+    return n;
   }
 
   recordResult(toolName: string, error: boolean): void {
@@ -429,6 +463,38 @@ export const MIN_REPEAT_CHUNK = 16;
 
 /** Jaccard similarity threshold for "near-identical" consecutive texts. */
 export const TEXT_SIMILARITY_THRESHOLD = 0.55;
+
+/** Shared-whitespace-token threshold for near-identical tool-call arguments. */
+export const NEAR_ARGS_SIMILARITY_THRESHOLD = 0.55;
+
+/**
+ * Minimum token union before two arg strings are comparable. Short inputs
+ * ({"i":"…","op":"view"}) would score 1.0 on one shared token; they rely on
+ * exact matching only. Long inputs — shell commands — always clear this.
+ */
+export const NEAR_ARGS_MIN_UNION = 5;
+// ponytail: 0.55 misses ONE shape — short (~11-token) commands that change
+// BOTH ends at once (added wrapper + changed tail glue → ~0.53); single-axis
+// drift and longer commands clear. Upgrade path if that shape shows up:
+// tokenize on punctuation boundaries instead of whitespace.
+
+/**
+ * Case-insensitive whitespace-token Jaccard over canonical args.
+ * Full tokens (no word filtering): a changed field glues into its own token,
+ * so only genuinely shared structure counts — same command with a rephrased
+ * `i` label scores ~0.8, two different commands score far below the threshold.
+ * Returns null when the union is too small to judge.
+ */
+export function argSimilarity(a: string, b: string): number | null {
+  const as = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
+  const bs = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
+  if (as.size === 0 || bs.size === 0) return null;
+  let inter = 0;
+  for (const t of as) if (bs.has(t)) inter++;
+  const union = as.size + bs.size - inter;
+  if (union < NEAR_ARGS_MIN_UNION) return null;
+  return inter / union;
+}
 
 /** Stable string form of a tool input (used for token estimation). */
 export function stringify(input: ToolInput): string {
@@ -685,6 +751,30 @@ if (import.meta.main) {
       .isErr(),
     "distinct parallel args are not spam",
   );
+
+  // 14. command-tail/wrapper drift: same poll wrapped or slightly reworded —
+  //     near-identical token overlap catches what exact identity cannot.
+  d.reset();
+  const ghTail = (command: string) => ({ command, cwd: "/w/flash", timeout: 30 });
+  assert.ok(d.check("bash", ghTail("gh run list --branch main --limit 3 2>&1 | head -6")).isErr());
+  d.record("bash", ghTail("gh run list --branch main --limit 3 2>&1 | head -6"));
+  assert.ok(
+    d
+      .check("bash", ghTail("sleep 150; gh run list --branch main --limit 3 2>&1 | head -6"))
+      .isErr(),
+  );
+  d.record("bash", ghTail("sleep 150; gh run list --branch main --limit 3 2>&1 | head -6"));
+  const nearHit = d.check(
+    "bash",
+    ghTail("timeout 30; gh run list --branch main --limit 3 2>&1 | head -6"),
+  );
+  assert.ok(nearHit.isOk(), "3rd command-tail variant should block");
+  if (nearHit.isOk()) {
+    assert.match(nearHit.value.reason, /near-identical arguments 3 times/);
+    assert.equal(nearHit.value.escalate, false, "first near block does not escalate");
+  }
+  // genuinely different command with the same tool stays unblocked
+  assert.ok(d.check("bash", { command: "cargo test -p pools 2>&1 | tail -5" }).isErr());
 
   console.log("detector self-check: all assertions passed");
 }

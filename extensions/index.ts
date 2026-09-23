@@ -7,6 +7,9 @@
  *
  *  - identical (tool, args) repeated `PI_ANTI_LOOP_REPEATS` times (default 3)
  *    in the last `PI_ANTI_LOOP_WINDOW` calls → block with an instructive reason
+ *  - near-identical same-tool args (≥ 55% shared whitespace tokens, union ≥ 5)
+ *    count toward the same threshold — sleep-wrapped polls, flag/pattern/tail
+ *    drift that exact identity misses by construction
  *  - the same tool failing `PI_ANTI_LOOP_FAILS` consecutive times (default 3)
  *    → block with a "stop retrying, fix the root cause" reason
  *  - the model repeating text: verbatim, near-identical (token similarity),
@@ -19,8 +22,12 @@
  * instructive reason (that is the steer); re-issuing the exact same blocked
  * call aborts the turn.
  *
- * Counters reset on every user prompt, so a task legitimately repeated later
- * in the session is never a false positive. Disable with PI_ANTI_LOOP_DISABLE=1.
+ * Counters reset on every user prompt (`message_end` with `role:"user"`), so
+ * a task legitimately repeated later in the session is never a false positive.
+ * Run restarts (auto-continue, steers/resumes, async-result drains) do NOT
+ * reset — hosts emit `before_agent_start` on every run start, and resetting
+ * there wiped counters between the iterations of cross-run loops. Disable with
+ * PI_ANTI_LOOP_DISABLE=1.
  *
  * All logic lives in `controller.ts` (pure, pi-free, unit-tested); this file
  * is a thin adapter wiring it to pi's event loop. The pi API is consumed
@@ -82,10 +89,6 @@ export default function (pi: PiLike): void {
 
   pi.on("session_start", () => reset());
 
-  // Fresh counters per user prompt: only the loop happening *right now* counts.
-  // Internal reset keeps session-scoped steers/aborts/resume budget.
-  pi.on("before_agent_start", () => controller.reset());
-
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
     // SAFETY: pi delivers JSON-safe tool arguments, which is exactly the ToolInput domain.
     // Decode them into the ToolInput domain type at this I/O boundary before the controller sees them.
@@ -108,8 +111,20 @@ export default function (pi: PiLike): void {
 
   // Text-only doom loops (model re-emits/rephrases the same thing with no
   // tool calls) never reach tool_call. Steer first, abort as escalation,
-  // then a bounded auto-resume so the work continues.
+  // then a bounded auto-resume so work continues.
   pi.on("message_end", (event: MessageEndEventLite, ctx: CtxLite) => {
+    // Fresh counters per genuine user prompt: only the loop happening *right
+    // now* counts (session-scoped steers/aborts/resume budget survive).
+    // Deliberately NOT on `before_agent_start`: hosts emit that on every run
+    // start — auto-continue turns, steers/resumes, advisor cards, and queued
+    // async-result drains — which wiped counters between the iterations of
+    // cross-run doom loops, so they never reached the repeat threshold.
+    // `role:"user"` input messages are emitted with the run's input messages
+    // (agent-core `emitInputMessages`) on omp and pi alike.
+    if (event.message.role === "user") {
+      controller.reset();
+      return;
+    }
     // SAFETY: pi delivers message content as JSON-safe blocks matching MessageContent.
     // Decode the untyped message content into MessageContent at this boundary.
     const outcome = controller.onMessageEnd(

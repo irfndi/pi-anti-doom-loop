@@ -1,6 +1,6 @@
 {
   "name": "pi-anti-doom-loop",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "Detect and break agent doom loops in pi: blocks identical repeated tool calls and blind retries before they burn tokens.",
   "keywords": [
     "anti-doom-loop",
@@ -40,9 +40,9 @@
     "prepare": "effect-tsgo patch --no-typescript --oxlint --skip-missing"
   },
   "dependencies": {
+    "@effect/tsgo": "^0.36.4",
     "better-result": "^3.0.0",
     "effect": "^4.0.0-rc.108",
-    "@effect/tsgo": "^0.36.4",
     "oxlint": "1.77.0"
   },
   "devDependencies": {

@@ -2,6 +2,20 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.0.10] — 2026-09-23
+
+### Fixed
+
+- **Counters reset per user prompt, not per run** — the extension reset on `before_agent_start`, which omp emits on _every_ run start: auto-continue turns (`role:"developer"`), steers/resumes, advisor cards, and queued async-result drains all restart the run, wiping counters (including block-escalation state) between the iterations of exactly the cross-run loops this extension exists to catch. Reported identical `ssh`-polling loops ran 7+ times unblocked while intra-run repeats fired correctly — replaying the incident session on detector-visible input reproduces its 9 exact blocks, with the only discrepancies landing right after post-abort run restarts, where the per-run reset had cleared the window. Reset now keys off `message_end` with `role:"user"` (emitted with the run's input messages on omp and pi alike), matching the documented per-user-prompt contract; steers and auto-continues keep counting, so the steer→abort escalation ladder survives run restarts too.
+
+### Added
+
+- **Near-identical tool-call detection** — when no exact signature repeats, `check()` counts same-tool window entries whose canonical args share ≥ 55% whitespace tokens (token union ≥ 5): sleep-wrapped polls (`gh run list…` → `sleep 150; gh run list…`), flag/grep-pattern/tail drift. Block reason prefix: _"…" was called with near-identical arguments N times…_. Short inputs stay exact-only via the union guard; exact repeats still block first with the exact reason.
+
+### Notes
+
+- omp strips the harness intent label (`i`) at parse (`extractIntent`), before extension events — this detector never sees it; no handling was added. pi has no intent field at all.
+
 ## [0.0.9] — 2026-09-07
 
 ### Added

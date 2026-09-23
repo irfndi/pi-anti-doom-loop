@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   LoopDetector,
+  argSimilarity,
   canonical,
   signature,
   normalizeText,
@@ -13,6 +14,7 @@ import {
   repeatedSegment,
   tokenSimilarity,
   readOptions,
+  NEAR_ARGS_SIMILARITY_THRESHOLD,
   DEFAULT_OPTIONS,
   type LoopOptions,
 } from "../extensions/detector.ts";
@@ -115,6 +117,92 @@ describe("identical-call detection", () => {
     } finally {
       Date.now = realNow;
     }
+  });
+});
+
+describe("near-identical argument detection", () => {
+  // Detector-visible drift: the incident session's poll loops vary the command
+  // itself (sleep wrappers, flag/grep-pattern/tail changes) so no exact
+  // signature ever repeats — exact identity misses these by construction.
+  const gh = (command: string) => ({ command, cwd: "/w/flash", timeout: 30 });
+  const BASE = "gh run list --branch feat/exploration1 --limit 2 2>&1 | head -4";
+  const cargo = (command: string) => ({ command, cwd: "/w/flash", timeout: 120 });
+
+  it("blocks 3 sleep-wrapped/tail-drift variants of one command", () => {
+    const d = new LoopDetector(opts);
+    assert.ok(d.check("bash", gh(BASE)).isErr());
+    d.record("bash", gh(BASE));
+    assert.ok(d.check("bash", gh(`timeout 30; ${BASE}`)).isErr());
+    d.record("bash", gh(`timeout 30; ${BASE}`));
+    const hit = d.check("bash", gh(`sleep 150; ${BASE}`));
+    assert.ok(hit.isOk(), "3rd near-identical variant must block");
+    if (hit.isOk()) {
+      assert.match(hit.value.reason, /near-identical arguments 3 times/);
+      assert.equal(hit.value.escalate, false);
+    }
+  });
+
+  it("counts exact repeats toward the near-identical total", () => {
+    const d = new LoopDetector(opts);
+    d.check("bash", gh(BASE));
+    d.record("bash", gh(BASE));
+    d.check("bash", gh(BASE));
+    d.record("bash", gh(BASE));
+    const hit = d.check("bash", gh(`sleep 150; ${BASE}`));
+    assert.ok(hit.isOk(), "2 exact + 1 near = 3 must block");
+    if (hit.isOk()) assert.match(hit.value.reason, /near-identical arguments 3 times/);
+  });
+
+  it("exact repeats still block first, with the exact reason", () => {
+    const d = new LoopDetector(opts);
+    const same = gh(BASE);
+    d.check("bash", same);
+    d.record("bash", same);
+    d.check("bash", same);
+    d.record("bash", same);
+    const hit = d.check("bash", same);
+    assert.ok(hit.isOk());
+    if (hit.isOk()) {
+      assert.match(hit.value.reason, /called with identical arguments 3 times/);
+      assert.doesNotMatch(hit.value.reason, /near-identical/);
+    }
+  });
+
+  it("does not block genuinely different commands", () => {
+    const d = new LoopDetector(opts);
+    assert.ok(d.check("bash", gh(BASE)).isErr());
+    d.record("bash", gh(BASE));
+    assert.ok(d.check("bash", cargo("cargo test -p pools 2>&1 | tail -5")).isErr());
+    d.record("bash", cargo("cargo test -p pools 2>&1 | tail -5"));
+    // One prior near match for gh — below threshold.
+    assert.ok(d.check("bash", gh(`sleep 150; ${BASE}`)).isErr());
+    d.record("bash", gh(`sleep 150; ${BASE}`));
+    assert.ok(d.check("bash", { command: "./ops/deploy.sh build 2>&1 | tail -2" }).isErr());
+  });
+
+  it("keeps short inputs exact-only (no single-shared-token matches)", () => {
+    const d = new LoopDetector(opts);
+    for (const i of ["Viewing canary tasks", "Viewing ladder tasks", "Viewing gate tasks"]) {
+      assert.ok(d.check("todo", { i, op: "view" }).isErr(), `todo view "${i}" must pass`);
+      d.record("todo", { i, op: "view" });
+    }
+  });
+
+  it("argSimilarity: threshold, case folding, and small-union guards", () => {
+    assert.equal(
+      argSimilarity('{"command":"true"}', '{"command":"false"}'),
+      null,
+      "union < 5 is not comparable",
+    );
+    assert.equal(argSimilarity("a b", "a c"), null, "union < 5 is not comparable");
+    assert.equal(argSimilarity("", "a b c d e"), null, "empty side is not comparable");
+    const ci = argSimilarity("Polling CI status rerun now", "polling ci status rerun now");
+    assert.ok(
+      ci !== null && ci >= NEAR_ARGS_SIMILARITY_THRESHOLD,
+      "case-insensitive equality scores 1",
+    );
+    const diff = argSimilarity("alpha beta gamma delta epsilon", "zeta eta theta iota kappa");
+    assert.ok(diff !== null && diff < NEAR_ARGS_SIMILARITY_THRESHOLD, "disjoint tokens score 0");
   });
 });
 

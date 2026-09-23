@@ -333,19 +333,33 @@ describe("index.ts adapter (fake PiLike)", () => {
     assert.equal(sent.length, 2, "no second resume — budget is bounded");
   });
 
-  it("resets counters on before_agent_start", () => {
+  it("keeps counters across run restarts, resets on a user prompt", () => {
     const { pi, fire } = makeFakePi();
     indexDefault(pi);
     const ctx = fakeCtx();
     fire("tool_call", { toolName: "bash", toolCallId: "1", input: { command: "grep foo" } }, ctx);
     fire("tool_call", { toolName: "bash", toolCallId: "2", input: { command: "grep foo" } }, ctx);
-    fire("before_agent_start", {}, ctx);
+
+    // Agent-originated run restarts must NOT wipe counters — that is what let
+    // cross-run loops escape. The extension deliberately no longer subscribes
+    // to `before_agent_start` (hosts emit it per run start); a custom-role
+    // input message — how steers/async drains actually arrive — must not reset.
+    fire("message_end", { message: { role: "custom", content: [] } }, ctx);
     const r = fire(
       "tool_call",
       { toolName: "bash", toolCallId: "3", input: { command: "grep foo" } },
       ctx,
     );
-    assert.equal(r, undefined, "after reset the same call passes again");
+    assert.ok(r, "3rd identical call still blocks after run restarts");
+
+    // A genuine user prompt resets: the same call passes again.
+    fire("message_end", { message: { role: "user", content: [] } }, ctx);
+    const after = fire(
+      "tool_call",
+      { toolName: "bash", toolCallId: "4", input: { command: "grep foo" } },
+      ctx,
+    );
+    assert.equal(after, undefined, "after a user prompt the same call passes again");
   });
 
   it("registers the /loopcheck command with status, reset, suspend, resume", async () => {
