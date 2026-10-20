@@ -48,7 +48,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@oxlint/plugins": "1.88.0",
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.6.5",
     "oxfmt": "0.74.0",
     "oxlint": "1.88.0",
     "oxlint-tsgolint": "7.0.2004",
