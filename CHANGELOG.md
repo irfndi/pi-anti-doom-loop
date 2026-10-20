@@ -2,7 +2,7 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
-## [Unreleased]
+## [0.0.13] — 2026-10-20
 
 ### Fixed
 
