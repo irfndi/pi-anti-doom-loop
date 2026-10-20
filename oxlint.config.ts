@@ -48,5 +48,14 @@ export default defineConfig({
       files: ["**/*"],
       rules: effectNativeOff,
     },
+    {
+      // node:test owns the promise returned by it()/before()/describe()
+      // callbacks — it awaits them itself, so the rule sees a floating promise
+      // that is not floating. Every async test would otherwise need a no-op
+      // `void` prefix. Real floating promises inside a test body are rare and
+      // show up as a hanging or timing-out test instead.
+      files: ["tests/**"],
+      rules: { "typescript/no-floating-promises": "off" },
+    },
   ],
 });

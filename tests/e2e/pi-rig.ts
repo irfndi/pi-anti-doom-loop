@@ -62,6 +62,13 @@ export async function ensurePi(): Promise<string> {
   return cache;
 }
 
+/** True when `server.address()` returned the TCP variant (not a pipe path). */
+function isAddressInfo(value: unknown): value is { port: number } {
+  return (
+    typeof value === "object" && value !== null && "port" in value && typeof value.port === "number"
+  );
+}
+
 /** The installed pi's version string (read from its package.json). */
 export async function installedPiVersion(piRoot: string): Promise<string> {
   // SAFETY: the rig installs this exact package, whose manifest carries
@@ -164,11 +171,8 @@ export class FakeOpenAI {
     return new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", () => {
-        const addr: unknown = server.address();
-        // SAFETY: listening on a fixed host with port 0 yields an AddressInfo
-        // object carrying the assigned port; the string variant only occurs
-        // when listening on a pipe path, which we never do.
-        assert.ok(addr !== null && addr instanceof Object && "port" in addr);
+        const addr = server.address();
+        assert.ok(isAddressInfo(addr), "listening on a TCP port yields an AddressInfo");
         this.shutdown = () =>
           new Promise((done) => {
             server.close(() => done());
