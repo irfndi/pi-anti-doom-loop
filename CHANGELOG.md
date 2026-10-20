@@ -2,6 +2,12 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [Unreleased]
+
+### Fixed
+
+- **Release verification gave up too early** — npm holds new publishes for a malware scan before serving them; 0.0.13 was published at 10:33:55 and the registry only started serving it at 10:40:05, six minutes later and just past the step's five-minute budget, so the release job failed on a version that did publish. The poll now runs for 15 minutes, matching npm's documented worst case, and its failure message says the version is published but still on hold.
+
 ## [0.0.13] — 2026-10-20
 
 ### Fixed

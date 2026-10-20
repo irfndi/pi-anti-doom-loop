@@ -55,17 +55,18 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # npm scans new publishes before serving them, so `publish` succeeding
-      # does not mean `install` works yet. Wait for the registry to confirm.
+      # does not mean `install` works yet. The hold is usually a few minutes but
+      # can stretch past ten, so poll for up to 15 minutes before failing.
       - name: Verify the published version is installable
         run: |
           version=$(node -p "require('./package.json').version")
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 60); do
             if npm view "pi-anti-doom-loop@$version" version >/dev/null 2>&1; then
-              echo "registry serves pi-anti-doom-loop@$version"
+              echo "registry serves pi-anti-doom-loop@$version (attempt $attempt)"
               exit 0
             fi
-            echo "waiting for the registry to serve $version (attempt $attempt/30)"
-            sleep 10
+            echo "published, waiting for the registry to serve $version (attempt $attempt/60)"
+            sleep 15
           done
-          echo "::error::registry still does not serve $version after 5 minutes"
+          echo "::error::pi-anti-doom-loop@$version is published but the registry still does not serve it after 15 minutes; check npm for a security hold before re-running anything"
           exit 1
