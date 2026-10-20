@@ -6,6 +6,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # Types must match the oldest runtime we support (engines: node >=22.18),
+      # not the newest release; bump deliberately with the engine floor.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       # Routine bumps arrive as one PR; majors stay separate for review.
       minor-and-patch:
