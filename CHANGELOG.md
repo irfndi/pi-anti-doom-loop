@@ -9,6 +9,10 @@ All notable changes to **pi-anti-doom-loop**.
 - **`tinypool` critical advisories** — `oxfmt` 0.62.0 pinned `tinypool` 2.1.0, which carries two critical prototype-pollution-to-RCE advisories (`GHSA-85c8-ppgw-ccpr`, `GHSA-5gmw-xhrv-c9v3`); dev-only, but critical. `oxfmt` is now 0.74.0 (`tinypool` 2.2.0) and `pnpm audit` is clean.
 - **Deprecated Actions runtime** — `actions/checkout` and `actions/setup-node` were pinned to v4 commits, which GitHub now forces from Node 20 to Node 24 with a warning on every run. Both are on v7, which targets Node 24 natively.
 
+### Changed
+
+- **Toolchain refresh** — TypeScript 7.0.2 (the compiler no longer includes `@types/node` implicitly, so `tsconfig` lists `"node"`), `@effect/tsgo` 0.53.3 with its matching `oxlint-tsgolint` 7.0.2004 override, `oxlint` 1.88.0, `effect` 4.0.5, and `@earendil-works/pi-coding-agent` 1.3.0 for development. `@types/node` stays on 22 so the types match `engines` rather than the newest Node release. `typescript/no-floating-promises` is off for `tests/` only: `node:test` awaits the promises its callbacks return itself.
+
 ### Added
 
 - **CI on every push and pull request** — `.github/workflows/ci.yml` runs the same gate as `prepublishOnly`, so master can no longer drift from the release check.
