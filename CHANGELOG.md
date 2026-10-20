@@ -2,6 +2,18 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [Unreleased]
+
+### Fixed
+
+- **`tinypool` critical advisories** — `oxfmt` 0.62.0 pinned `tinypool` 2.1.0, which carries two critical prototype-pollution-to-RCE advisories (`GHSA-85c8-ppgw-ccpr`, `GHSA-5gmw-xhrv-c9v3`); dev-only, but critical. `oxfmt` is now 0.74.0 (`tinypool` 2.2.0) and `pnpm audit` is clean.
+- **Deprecated Actions runtime** — `actions/checkout` and `actions/setup-node` were pinned to v4 commits, which GitHub now forces from Node 20 to Node 24 with a warning on every run. Both are on v7, which targets Node 24 natively.
+
+### Added
+
+- **CI on every push and pull request** — `.github/workflows/ci.yml` runs the same gate as `prepublishOnly`, so master can no longer drift from the release check.
+- **Dependabot** — weekly npm and GitHub Actions updates (minor/patch grouped), with vulnerability alerts and automated security fixes enabled on the repository.
+
 ## [0.0.12] — 2026-10-01
 
 ### Added
