@@ -170,7 +170,7 @@ git tag v0.0.1
 git push origin v0.0.1
 ```
 
-CI runs the quality gate with pnpm, then the **version bump guard** (`pnpm run guard`): it blocks publishing if the version is already on npm or the tag doesn't match `package.json`. After the first publish, the [pi.dev gallery](https://pi.dev/packages) picks the package up automatically via the `pi-package` keyword.
+CI runs the quality gate with pnpm, then the **version bump guard** (`pnpm run guard`): it blocks publishing if the version is already on npm or the tag doesn't match `package.json`. After publishing, the workflow polls the registry until the new version is actually installable — npm scans new publishes before serving them, so `publish` succeeding is not the same as `install` working. After the first publish, the [pi.dev gallery](https://pi.dev/packages) picks the package up automatically via the `pi-package` keyword.
 
 ## License
 
