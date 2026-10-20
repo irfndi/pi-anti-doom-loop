@@ -29,14 +29,18 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # tags visible to the version guard
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817dc086c27694cf70 # v4.1.0
+        with:
+          version: 12.8.1
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-          cache: npm
+          cache: pnpm
 
       - name: Quality gate (self-check, typecheck, lint, format)
-        run: npm ci && npm run check
+        run: pnpm install --frozen-lockfile && pnpm run check
 
       - name: Version bump guard
         run: node scripts/guard-publish.ts "$EXPECTED"
@@ -45,7 +49,7 @@ jobs:
 
       - name: Publish to npm
         run: |
-          npm publish --dry-run
-          npm publish
+          pnpm publish --dry-run --no-git-checks
+          pnpm publish --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

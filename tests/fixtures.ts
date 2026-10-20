@@ -120,3 +120,85 @@ export const healthySession: CallFixture = {
     { tool: "write", args: { path: "src/c.ts" } },
   ],
 };
+
+// --- codemode (pi ≥ 0.99): nested calls inside ONE script -------------------
+
+/** One nested tool call made by a codemode script (`parentToolCallId` set). */
+export interface NestedFixtureEvent {
+  /** Tool call id of the parent codemode call (pi formats children as `<parent>/<n>`). */
+  parent: string;
+  id: string;
+  tool: string;
+  args: ToolInput;
+  isError?: boolean;
+}
+
+/** A named transcript of nested codemode traffic. */
+export interface NestedFixture {
+  name: string;
+  /** The script source (documentation of what the nested events came from). */
+  script: string;
+  events: NestedFixtureEvent[];
+}
+
+/**
+ * The codemode doom loop this extension exists to catch: a script polling the
+ * same file in a loop. Per-call detection never sees it as a streak — every
+ * nested call is part of ONE top-level tool call.
+ */
+export const codemodeNestedLoop: NestedFixture = {
+  name: "codemode script polls the same file 5× inside one script",
+  script:
+    'for (let i = 0; i < 5; i++) { await tools.read({ path: "src/config.json" }); } return "done";',
+  events: Array.from({ length: 5 }, (_, i) => ({
+    parent: "cm1",
+    id: `cm1/${i + 1}`,
+    tool: "read",
+    args: { path: "src/config.json" },
+  })),
+};
+
+/**
+ * A script that retries an identical call after it errored — the in-script
+ * error-retry rule must block the retry immediately.
+ */
+export const codemodeErrorRetryLoop: NestedFixture = {
+  name: "codemode script retries an identical call after it errored",
+  script:
+    'try { await tools.bash({ command: "npm test" }); } catch {} await tools.bash({ command: "npm test" }); return "retried";',
+  events: [
+    { parent: "cm1", id: "cm1/1", tool: "bash", args: { command: "npm test" }, isError: true },
+    { parent: "cm1", id: "cm1/2", tool: "bash", args: { command: "npm test" } },
+  ],
+};
+
+/**
+ * Two scripts re-issuing the same signature in one prompt: the second block
+ * must escalate (the model ignored the first script's error).
+ */
+export const codemodeCrossScriptRepeat: NestedFixture = {
+  name: "two codemode scripts repeat the same signature across scripts",
+  script:
+    'await tools.read({ path: "src/config.json" }); await tools.read({ path: "src/config.json" });',
+  events: [
+    { parent: "cm1", id: "cm1/1", tool: "read", args: { path: "src/config.json" } },
+    { parent: "cm1", id: "cm1/2", tool: "read", args: { path: "src/config.json" } },
+    { parent: "cm2", id: "cm2/1", tool: "read", args: { path: "src/config.json" } },
+    { parent: "cm2", id: "cm2/2", tool: "read", args: { path: "src/config.json" } },
+  ],
+};
+
+/**
+ * The pattern codemode's own docs recommend — batch DISTINCT calls with
+ * Promise.allSettled in ONE script. Must never block.
+ */
+export const codemodeHealthyBatch: NestedFixture = {
+  name: "codemode batches distinct reads with Promise.allSettled (recommended pattern)",
+  script:
+    'await Promise.allSettled([tools.read({ path: "src/a.ts" }), tools.read({ path: "src/b.ts" }), tools.grep({ pattern: "TODO", path: "src/" })]); return "ok";',
+  events: [
+    { parent: "cm1", id: "cm1/1", tool: "read", args: { path: "src/a.ts" } },
+    { parent: "cm1", id: "cm1/2", tool: "read", args: { path: "src/b.ts" } },
+    { parent: "cm1", id: "cm1/3", tool: "grep", args: { pattern: "TODO", path: "src/" } },
+  ],
+};

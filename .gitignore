@@ -2,3 +2,4 @@ node_modules/
 *.log
 .clawpatch/
 .deepsec/
+.oh-my-plumb/

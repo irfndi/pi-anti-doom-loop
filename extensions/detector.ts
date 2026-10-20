@@ -163,6 +163,17 @@ export class LoopDetector {
   private textStreak = 0;
   private wastedTokens = 0;
 
+  // --- nested codemode calls (pi ≥ 0.99: `parentToolCallId` set) ---
+  /** Per-parent (per-script) call windows, keyed by the parent tool-call id. */
+  private nestedSigs = new Map<string, { sig: string; tool: string; args: string }[]>();
+  /** Nested call ids in flight, for wiring results back to their signature. */
+  private nestedIds = new Map<string, { tool: string; args: string }>();
+  /** Blocks per nested signature, prompt-scoped: a NEW script re-issuing a blocked signature escalates. */
+  private nestedBlockedBySig = new Map<string, number>();
+  /** Signatures whose identical nested call already errored inside that script. */
+  private nestedErrorSigs = new Map<string, Set<string>>();
+  private nestedCallCount = 0;
+
   constructor(opts: LoopOptions = DEFAULT_OPTIONS) {
     this.opts = opts;
   }
@@ -227,10 +238,101 @@ export class LoopDetector {
     this.evictSigs();
   }
 
+  /**
+   * Canonical args of a nested call, capped: scripts can issue huge payloads
+   * (a whole file read back) hundreds of times; identity only needs the head.
+   */
+  private canonicalNestedArgs(input: ToolInput): string {
+    const raw = canonical(input);
+    return raw.length > NESTED_ARG_STORAGE_LIMIT ? raw.slice(0, NESTED_ARG_STORAGE_LIMIT) : raw;
+  }
+
+  /**
+   * Stricter detection for calls a codemode script made (`parentToolCallId` set).
+   * Inside one script a repeated call is never progress — the script can store
+   * and reuse its first result — so identical args block at
+   * `NESTED_REPEAT_THRESHOLD` (2), and an identical retry of a call that
+   * already errored in this script blocks immediately. The block reason
+   * becomes the script's tool error; `escalate` is true when this signature
+   * was already blocked in an earlier script this prompt.
+   */
+  checkNested(parentToolCallId: string, toolName: string, input: ToolInput): NestedDecision {
+    if (this.opts.toolExclude.has(toolName)) return Result.err(undefined);
+    const args = this.canonicalNestedArgs(input);
+    const sig = `${toolName}:${args}`;
+    const pool = this.nestedSigs.get(parentToolCallId) ?? [];
+    const repeats = pool.filter((s) => s.sig === sig).length;
+    const reasons = collectNestedBlockReasons(
+      toolName,
+      repeats,
+      this.nestedErrorSigs.get(parentToolCallId)?.has(sig) === true,
+      () => this.nearRepeats(toolName, args, pool),
+    );
+    if (reasons.length === 0) return Result.err(undefined);
+
+    const blockedCount = (this.nestedBlockedBySig.get(sig) ?? 0) + 1;
+    this.nestedBlockedBySig.set(sig, blockedCount);
+    return Result.ok({
+      reason:
+        reasons.join("; ") +
+        `. BLOCKED by anti-doom-loop — inside a script, store the first result in a variable and reuse it instead of calling again.`,
+      escalate: blockedCount > 1,
+    });
+  }
+
+  /** Record an allowed nested call into its parent script's window. */
+  recordNested(
+    parentToolCallId: string,
+    toolName: string,
+    toolCallId: string,
+    input: ToolInput,
+  ): void {
+    if (this.opts.toolExclude.has(toolName)) return;
+    const args = this.canonicalNestedArgs(input);
+    let pool = this.nestedSigs.get(parentToolCallId);
+    if (!pool) {
+      pool = [];
+      this.nestedSigs.set(parentToolCallId, pool);
+    }
+    pool.push({ sig: `${toolName}:${args}`, tool: toolName, args });
+    if (pool.length > NESTED_POOL_LIMIT) pool.splice(0, pool.length - NESTED_POOL_LIMIT);
+    this.nestedIds.set(toolCallId, { tool: toolName, args });
+    this.nestedCallCount++;
+  }
+
+  /** Wire a nested result back: an errored signature blocks its identical retry. */
+  recordNestedResult(parentToolCallId: string, toolCallId: string, isError: boolean): void {
+    const entry = this.nestedIds.get(toolCallId);
+    this.nestedIds.delete(toolCallId);
+    if (!isError || !entry) return;
+    let errs = this.nestedErrorSigs.get(parentToolCallId);
+    if (!errs) {
+      errs = new Set();
+      this.nestedErrorSigs.set(parentToolCallId, errs);
+    }
+    errs.add(`${entry.tool}:${entry.args}`);
+    if (errs.size > NESTED_POOL_LIMIT) {
+      const oldest = errs.values().next();
+      if (!oldest.done) errs.delete(oldest.value);
+    }
+  }
+
+  /** Nested codemode counters for /loopcheck (allowed calls recorded, blocks issued). */
+  nestedStats(): NestedStats {
+    return {
+      calls: this.nestedCallCount,
+      blocks: [...this.nestedBlockedBySig.values()].reduce((a, b) => a + b, 0),
+    };
+  }
+
   /** Windowed same-tool entries whose args are ≥55% shared tokens (identical counts). */
-  private nearRepeats(toolName: string, args: string): number {
+  private nearRepeats(
+    toolName: string,
+    args: string,
+    pool: readonly { tool: string; args: string }[] = this.recentSigs,
+  ): number {
     let n = 0;
-    for (const s of this.recentSigs) {
+    for (const s of pool) {
       if (s.tool !== toolName) continue;
       const sim = argSimilarity(args, s.args);
       if (sim !== null && sim >= NEAR_ARGS_SIMILARITY_THRESHOLD) n++;
@@ -424,10 +526,12 @@ export class LoopDetector {
       .map(([s, n]) => `"${truncate(s, 24)}" x${n}`)
       .join(", ");
 
+    const nested = this.nestedStats();
     return (
       `calls[${this.recentSigs.length}] ${topSigs || "none"}; ` +
       `texts[${this.recentTexts.length}] ${topTexts || "none"}; ` +
-      `wastedTokens=${this.wastedTokens}`
+      `wastedTokens=${this.wastedTokens}; ` +
+      `nested: calls=${nested.calls} blocks=${nested.blocks}`
     );
   }
 
@@ -439,6 +543,11 @@ export class LoopDetector {
     this.lastText = null;
     this.textStreak = 0;
     this.wastedTokens = 0;
+    this.nestedSigs.clear();
+    this.nestedIds.clear();
+    this.nestedBlockedBySig.clear();
+    this.nestedErrorSigs.clear();
+    this.nestedCallCount = 0;
   }
 
   summary(): string {
@@ -473,6 +582,63 @@ export const NEAR_ARGS_SIMILARITY_THRESHOLD = 0.55;
  * exact matching only. Long inputs — shell commands — always clear this.
  */
 export const NEAR_ARGS_MIN_UNION = 5;
+
+/** Decision for a nested (codemode) tool call — same shape as BlockDecision. */
+export type NestedDecision = Result<BlockDecision, undefined>;
+
+/**
+ * Block reasons for one nested codemode call: identical repeats (2× rule),
+ * an identical retry of a call that already errored in this script, and —
+ * only when neither fired — near-identical args at the same 2× threshold.
+ * `nearRepeats` is lazy so random traffic never pays the tokenization cost.
+ */
+function collectNestedBlockReasons(
+  toolName: string,
+  repeats: number,
+  erroredBefore: boolean,
+  nearRepeats: () => number,
+): string[] {
+  const reasons: string[] = [];
+  if (repeats + 1 >= NESTED_REPEAT_THRESHOLD) {
+    reasons.push(
+      `"${toolName}" was called with identical arguments ${repeats + 1} times inside one codemode script`,
+    );
+  }
+  if (erroredBefore) {
+    reasons.push(`the identical "${toolName}" call already failed inside this script`);
+  }
+  if (reasons.length === 0 && repeats === 0 && nearRepeats() + 1 >= NESTED_REPEAT_THRESHOLD) {
+    reasons.push(
+      `"${toolName}" was called with near-identical arguments ${nearRepeats() + 1} times inside one codemode script (only minor changes)`,
+    );
+  }
+  return reasons;
+}
+
+/** Counters for nested codemode traffic, reported by /loopcheck. */
+export interface NestedStats {
+  calls: number;
+  blocks: number;
+}
+
+/**
+ * Nested codemode calls (pi ≥ 0.99, `parentToolCallId` set) block at a stricter
+ * threshold than top-level calls: inside one script a repeated call is never
+ * progress — the script can reuse its first result — so 2 occurrences block
+ * where top-level detection needs 3.
+ */
+export const NESTED_REPEAT_THRESHOLD = 2;
+
+/** Max chars of one nested call's canonical args kept for identity/similarity. */
+export const NESTED_ARG_STORAGE_LIMIT = 100_000;
+
+/**
+ * Max recent calls a codemode script's window keeps. Entries hold up to
+ * `NESTED_ARG_STORAGE_LIMIT` chars each, so an unbounded per-script window
+ * would let one script pin hundreds of MB; in-script loops repeat adjacent
+ * calls, which a recent window still catches.
+ */
+export const NESTED_POOL_LIMIT = 100;
 // ponytail: 0.55 misses ONE shape — short (~11-token) commands that change
 // BOTH ends at once (added wrapper + changed tail glue → ~0.53); single-axis
 // drift and longer commands clear. Upgrade path if that shape shows up:
@@ -775,6 +941,47 @@ if (import.meta.main) {
   }
   // genuinely different command with the same tool stays unblocked
   assert.ok(d.check("bash", { command: "cargo test -p pools 2>&1 | tail -5" }).isErr());
+
+  // 15. nested codemode calls: stricter 2× threshold, error-retry block, no
+  //     leakage into the top-level window
+  d.reset();
+  assert.ok(d.checkNested("p1", "read", { path: "a.ts" }).isErr(), "1st nested call passes");
+  d.recordNested("p1", "read", "p1/1", { path: "a.ts" });
+  const nHit = d.checkNested("p1", "read", { path: "a.ts" });
+  assert.ok(nHit.isOk(), "2nd identical nested call blocks");
+  if (nHit.isOk()) {
+    assert.equal(nHit.value.escalate, false, "first in-script block does not escalate");
+    assert.match(nHit.value.reason, /identical arguments 2 times inside one codemode script/);
+  }
+  assert.ok(d.checkNested("p2", "read", { path: "a.ts" }).isErr(), "a new script starts clean");
+  // identical-after-error blocks even at the first occurrence in a parent
+  d.recordNested("p2", "bash", "p2/1", { command: "npm test" });
+  d.recordNestedResult("p2", "p2/1", true);
+  const errHit = d.checkNested("p2", "bash", { command: "npm test" });
+  assert.ok(errHit.isOk(), "identical retry after a nested error blocks");
+  if (errHit.isOk()) assert.match(errHit.value.reason, /already failed inside this script/);
+  // a NEW script re-issuing a signature blocked before escalates
+  const crossScript = d.checkNested("p3", "bash", { command: "npm test" });
+  assert.ok(crossScript.isErr(), "fresh script with a fresh call passes");
+  d.recordNested("p3", "bash", "p3/1", { command: "npm test" });
+  const crossBlock = d.checkNested("p3", "bash", { command: "npm test" });
+  assert.ok(crossBlock.isOk() && crossBlock.value.escalate, "cross-script repeat escalates");
+  // nested traffic never enters the top-level window
+  d.reset();
+  d.recordNested("p", "bash", "p/1", { command: "poll" });
+  d.recordNested("p", "bash", "p/2", { command: "poll" });
+  assert.ok(
+    d.check("bash", { command: "poll" }).isErr(),
+    "top-level window empty of nested traffic",
+  );
+  // huge nested payloads stay capped and never throw
+  assert.doesNotThrow(() => {
+    const huge = "x".repeat(300_000);
+    for (let i = 0; i < 50; i++) {
+      d.checkNested("p", "read", { path: `f${i}.ts`, content: huge });
+      d.recordNested("p", "read", `p/h${i}`, { path: `f${i}.ts`, content: huge });
+    }
+  });
 
   console.log("detector self-check: all assertions passed");
 }

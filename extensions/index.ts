@@ -76,6 +76,13 @@ const STEER_TEXT =
   "Stop. Re-read the actual error output, pick ONE different action, and execute it. " +
   "If you are stuck, ask the user instead of retrying.";
 
+/** Steer delivered after a codemode script swallowed a nested block: the script
+ * got the block reason as a tool error, but only its return reaches the model. */
+const NESTED_STEER_TEXT =
+  "Anti-doom-loop steering: a codemode script repeated identical tool calls inside itself. " +
+  "Inside a script, call each tool once, store the result in a variable, and reuse it — " +
+  "never poll or retry the same call in a loop. If the calls keep failing, stop and ask the user.";
+
 /** Queued once after an abort so the work can continue with a fresh approach. */
 const RESUME_TEXT =
   "Anti-doom-loop: the previous run was aborted because it looped. " +
@@ -96,6 +103,7 @@ export default function (pi: PiLike): void {
       event.toolName,
       event.input as ToolInput,
       event.toolCallId,
+      event.parentToolCallId,
     );
     if (outcome === null) return;
     if (outcome.escalate) {
@@ -106,7 +114,12 @@ export default function (pi: PiLike): void {
   });
 
   pi.on("tool_result", (event: ToolResultEventLite) => {
-    controller.onToolResult(event.toolName, event.toolCallId, event.isError === true);
+    controller.onToolResult(
+      event.toolName,
+      event.toolCallId,
+      event.isError === true,
+      event.parentToolCallId,
+    );
   });
 
   // Text-only doom loops (model re-emits/rephrases the same thing with no
@@ -134,9 +147,10 @@ export default function (pi: PiLike): void {
     if (outcome === null) return;
 
     if (outcome.action === "steer") {
+      const text = outcome.nested ? NESTED_STEER_TEXT : STEER_TEXT;
       ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "warning");
       pi.sendMessage?.(
-        { customType: "anti-doom-loop", content: STEER_TEXT, display: true },
+        { customType: "anti-doom-loop", content: text, display: true },
         { deliverAs: "steer", triggerTurn: true },
       );
       return;

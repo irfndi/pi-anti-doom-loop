@@ -15,6 +15,7 @@ import {
   tokenSimilarity,
   readOptions,
   NEAR_ARGS_SIMILARITY_THRESHOLD,
+  NESTED_POOL_LIMIT,
   DEFAULT_OPTIONS,
   type LoopOptions,
 } from "../extensions/detector.ts";
@@ -591,5 +592,150 @@ describe("helpers", () => {
   it("truncate keeps short text and ellipsizes long text", () => {
     assert.equal(truncate("short", 80), "short");
     assert.equal(truncate("abcdef", 3), "abc…");
+  });
+});
+
+describe("nested codemode calls (parentToolCallId, pi ≥ 0.99)", () => {
+  it("blocks the 2nd identical call inside one script (stricter than top-level 3×)", () => {
+    const d = new LoopDetector(opts);
+    assert.ok(d.checkNested("p1", "read", { path: "a.ts" }).isErr(), "1st nested call passes");
+    d.recordNested("p1", "read", "p1/1", { path: "a.ts" });
+    const hit = d.checkNested("p1", "read", { path: "a.ts" });
+    assert.ok(hit.isOk(), "2nd identical nested call must block");
+    if (hit.isOk()) {
+      assert.equal(hit.value.escalate, false, "first in-script block does not escalate");
+      assert.match(hit.value.reason, /identical arguments 2 times inside one codemode script/);
+      assert.match(hit.value.reason, /store the first result in a variable/);
+    }
+  });
+
+  it("each script has its own window — a new parent starts clean", () => {
+    const d = new LoopDetector(opts);
+    d.checkNested("p1", "read", { path: "a.ts" });
+    d.recordNested("p1", "read", "p1/1", { path: "a.ts" });
+    assert.ok(d.checkNested("p1", "read", { path: "a.ts" }).isOk(), "repeat within p1 blocks");
+    assert.ok(
+      d.checkNested("p2", "read", { path: "a.ts" }).isErr(),
+      "the same call in a new script must pass",
+    );
+  });
+
+  it("near-identical nested args also block at 2×", () => {
+    const d = new LoopDetector(opts);
+    d.recordNested("p1", "bash", "p1/1", {
+      command: "gh run list --branch main --limit 3 2>&1 | head -6",
+    });
+    const hit = d.checkNested("p1", "bash", {
+      command: "sleep 150; gh run list --branch main --limit 3 2>&1 | head -6",
+    });
+    assert.ok(hit.isOk(), "sleep-wrapped poll inside a script must block");
+    if (hit.isOk()) assert.match(hit.value.reason, /near-identical arguments 2 times/);
+  });
+
+  it("an identical retry of a call that already errored in this script blocks immediately", () => {
+    const d = new LoopDetector(opts);
+    d.recordNested("p1", "bash", "p1/1", { command: "npm test" });
+    d.recordNestedResult("p1", "p1/1", true);
+    const hit = d.checkNested("p1", "bash", { command: "npm test" });
+    assert.ok(hit.isOk(), "error-retry must block on first repeat");
+    if (hit.isOk()) assert.match(hit.value.reason, /already failed inside this script/);
+    // A successful first call still blocks the retry (the 2× rule), but the
+    // reason must not claim a failure happened.
+    const d2 = new LoopDetector(opts);
+    d2.recordNested("p1", "bash", "p1/1", { command: "npm test" });
+    d2.recordNestedResult("p1", "p1/1", false);
+    const retry = d2.checkNested("p1", "bash", { command: "npm test" });
+    assert.ok(retry.isOk(), "the 2× rule blocks a retry after a successful call too");
+    if (retry.isOk()) assert.doesNotMatch(retry.value.reason, /already failed/);
+  });
+
+  it("a NEW script re-issuing a previously blocked signature escalates", () => {
+    const d = new LoopDetector(opts);
+    d.recordNested("p1", "bash", "p1/1", { command: "npm test" });
+    const first = d.checkNested("p1", "bash", { command: "npm test" });
+    assert.ok(first.isOk() && !first.value.escalate);
+    d.recordNested("p2", "bash", "p2/1", { command: "npm test" });
+    const second = d.checkNested("p2", "bash", { command: "npm test" });
+    assert.ok(second.isOk() && second.value.escalate, "cross-script repeat escalates");
+  });
+
+  it("nested traffic never enters the top-level window (script-level isolation)", () => {
+    const d = new LoopDetector(opts);
+    for (let i = 0; i < 5; i++) {
+      d.checkNested("p1", "bash", { command: `cmd ${i}` });
+      d.recordNested("p1", "bash", `p1/${i}`, { command: `cmd ${i}` });
+    }
+    assert.ok(
+      d.check("bash", { command: "cmd 0" }).isErr(),
+      "top-level check must not see nested calls",
+    );
+    assert.ok(
+      d.checkNested("p1", "bash", { command: "cmd 0" }).isOk(),
+      "but the script window does",
+    );
+  });
+
+  it("top-level traffic never enters a script window", () => {
+    const d = new LoopDetector(opts);
+    d.record("bash", { command: "poll" });
+    assert.ok(d.checkNested("p1", "bash", { command: "poll" }).isErr(), "1st nested passes");
+    d.recordNested("p1", "bash", "p1/1", { command: "poll" });
+    assert.ok(
+      d.checkNested("p1", "bash", { command: "poll" }).isOk(),
+      "2nd nested blocks (2× rule)",
+    );
+  });
+
+  it("huge nested payloads are capped and never throw", () => {
+    const d = new LoopDetector(opts);
+    const huge = "x".repeat(300_000);
+    assert.doesNotThrow(() => {
+      for (let i = 0; i < 100; i++) {
+        d.checkNested("p1", "read", { path: `f${i}.ts`, content: huge });
+        d.recordNested("p1", "read", `p1/${i}`, { path: `f${i}.ts`, content: huge });
+      }
+    });
+    // Capped identity still matches: same head + same huge tail repeats.
+    const hit = d.checkNested("p1", "read", { path: "f0.ts", content: huge });
+    assert.ok(hit.isOk(), "capped signatures still detect the repeat");
+  });
+
+  it("keeps only the most recent calls of a script window", () => {
+    const d = new LoopDetector(opts);
+    for (let i = 0; i < NESTED_POOL_LIMIT + 50; i++) {
+      d.recordNested("p1", "read", `p1/${i}`, { path: `f${i}.ts` });
+    }
+    assert.ok(
+      d.checkNested("p1", "read", { path: "f0.ts" }).isErr(),
+      "a call older than the window is forgotten (bounded memory)",
+    );
+    const recent = NESTED_POOL_LIMIT + 49;
+    d.recordNested("p1", "read", "p1/recent", { path: `f${recent}.ts` });
+    assert.ok(
+      d.checkNested("p1", "read", { path: `f${recent}.ts` }).isOk(),
+      "recent calls still block at 2×",
+    );
+  });
+
+  it("excluded tools skip nested detection too", () => {
+    const d = new LoopDetector({ ...opts, toolExclude: new Set(["read"]) });
+    d.recordNested("p1", "read", "p1/1", { path: "a.ts" });
+    assert.ok(d.checkNested("p1", "read", { path: "a.ts" }).isErr());
+  });
+
+  it("nestedStats counts recorded calls and blocks; reset clears them", () => {
+    const d = new LoopDetector(opts);
+    d.recordNested("p1", "read", "p1/1", { path: "a.ts" });
+    d.checkNested("p1", "read", { path: "a.ts" }); // block #1
+    assert.deepEqual(d.nestedStats(), { calls: 1, blocks: 1 });
+    d.reset();
+    assert.deepEqual(d.nestedStats(), { calls: 0, blocks: 0 });
+  });
+
+  it("recordNestedResult for an unknown id is a no-op (late/foreign results)", () => {
+    const d = new LoopDetector(opts);
+    assert.doesNotThrow(() => d.recordNestedResult("p1", "unknown-id", true));
+    // And it must not arm the error-retry rule for anything.
+    assert.ok(d.checkNested("p1", "bash", { command: "npm test" }).isErr());
   });
 });

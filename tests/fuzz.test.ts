@@ -251,6 +251,61 @@ describe("fuzz: within-message self-repetition", () => {
   });
 });
 
+describe("fuzz: nested codemode call streams", () => {
+  it("never throws on random nested traffic across many scripts", () => {
+    const rand = rng(0x4e57ed);
+    for (let run = 0; run < 30; run++) {
+      const d = new LoopDetector(opts);
+      for (let i = 0; i < 200; i++) {
+        const parent = `p${Math.floor(rand() * 5)}`;
+        const tool = TOOLS[Math.floor(rand() * TOOLS.length)];
+        const args = randomArgs(rand);
+        d.checkNested(parent, tool, args); // may block or not — must not throw
+        d.recordNested(parent, tool, `p/${i}`, args);
+        d.recordNestedResult(parent, `p/${i}`, rand() > 0.8);
+      }
+    }
+  });
+
+  it("an injected identical in-script loop always blocks at the nested 2× rule", () => {
+    const rand = rng(0x4e5716);
+    for (let run = 0; run < 30; run++) {
+      const d = new LoopDetector(opts);
+      const loopArgs = { command: `gh run view ${run} --log` };
+      let blocked = false;
+      for (let i = 0; i < 50; i++) {
+        // Interleave random traffic from a sibling script; the loop is
+        // every other call inside p1.
+        if (i % 2 === 0) {
+          if (d.checkNested("p1", "bash", loopArgs).isOk()) blocked = true;
+          d.recordNested("p1", "bash", `p1/${i}`, loopArgs);
+        } else {
+          const args = withSeq(randomArgs(rand), i);
+          d.checkNested("p2", "read", args);
+          d.recordNested("p2", "read", `p2/${i}`, args);
+        }
+      }
+      assert.ok(blocked, `injected in-script loop must block (run ${run})`);
+    }
+  });
+
+  it("random in-script traffic with unique args never false-positives", () => {
+    const rand = rng(0x51b6);
+    for (let run = 0; run < 20; run++) {
+      const d = new LoopDetector(opts);
+      let blocked = 0;
+      for (let i = 0; i < 100; i++) {
+        const parent = `p${Math.floor(rand() * 3)}`;
+        const tool = TOOLS[Math.floor(rand() * TOOLS.length)];
+        const args = withSeq(randomArgs(rand), run * 1000 + i);
+        if (d.checkNested(parent, tool, args).isOk()) blocked++;
+        d.recordNested(parent, tool, `p/${run}-${i}`, args);
+      }
+      assert.equal(blocked, 0, `random nested stream false-flagged (run ${run})`);
+    }
+  });
+});
+
 describe("fuzz: canonical stability", () => {
   it("equivalent structures canonicalize identically", () => {
     const rand = rng(7);

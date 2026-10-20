@@ -385,3 +385,143 @@ describe("index.ts adapter (fake PiLike)", () => {
     assert.match(notices[3], /counters reset/);
   });
 });
+
+describe("nested codemode calls (parentToolCallId, pi ≥ 0.99)", () => {
+  it("routes nested calls through the stricter path and does not touch the top-level window", () => {
+    const c = createController();
+    // Script p1: 1st read passes, 2nd blocks at the nested 2× rule.
+    assert.equal(c.onToolCall("read", { path: "a.ts" }, "p1/1", "p1"), null);
+    const block = c.onToolCall("read", { path: "a.ts" }, "p1/2", "p1");
+    assert.ok(block !== null && block.block === true && block.nested === true);
+    assert.match(block.reason, /inside one codemode script/);
+    // The top-level window must stay clean.
+    assert.equal(
+      c.onToolCall("read", { path: "a.ts" }, "top1"),
+      null,
+      "nested traffic must not leak into the top-level window",
+    );
+  });
+
+  it("nested escalations abort the turn", () => {
+    const c = createController();
+    // p1: 2nd identical call blocks (no escalation). A NEW script starts
+    // clean, but once IT repeats the same signature, the cross-script block
+    // counter escalates.
+    c.onToolCall("read", { path: "a.ts" }, "p1/1", "p1");
+    const first = c.onToolCall("read", { path: "a.ts" }, "p1/2", "p1");
+    assert.ok(first !== null && !first.escalate);
+    assert.equal(
+      c.onToolCall("read", { path: "a.ts" }, "p2/1", "p2"),
+      null,
+      "new script starts clean",
+    );
+    const escalate = c.onToolCall("read", { path: "a.ts" }, "p2/2", "p2");
+    assert.ok(escalate !== null && escalate.escalate, "repeat in a new script escalates");
+  });
+
+  it("blocked nested ids are excluded from error streaks; allowed nested errors arm error-retry", () => {
+    const c = createController();
+    // Blocked call (p1/2) never ran: its error result must be swallowed…
+    c.onToolCall("read", { path: "a.ts" }, "p1/1", "p1");
+    c.onToolCall("read", { path: "a.ts" }, "p1/2", "p1"); // block
+    c.onToolResult("read", "p1/2", true, "p1");
+    // …and the FIRST blocked-id hit is consumed, so an identical id replay
+    // must not double-consume (defensive: pi never reuses ids).
+    c.onToolResult("read", "p1/2", true, "p1");
+    // Allowed error result arms the error-retry rule for the next script.
+    c.onToolCall("bash", { command: "npm test" }, "p3/1", "p3");
+    c.onToolResult("bash", "p3/1", true, "p3");
+    const hit = c.onToolCall("bash", { command: "npm test" }, "p3/2", "p3");
+    assert.ok(hit !== null, "identical retry after a nested error must block");
+    if (hit) assert.match(hit.reason, /already failed inside this script/);
+  });
+
+  it("message_end steers once with NESTED_STEER_TEXT after a script swallowed a nested block", () => {
+    const c = createController();
+    // A codemode block arms the one-shot steer.
+    c.onToolCall("read", { path: "a.ts" }, "p1/1", "p1");
+    assert.ok(c.onToolCall("read", { path: "a.ts" }, "p1/2", "p1") !== null);
+
+    // The script returns a plain summary; the assistant message looks healthy.
+    const outcome = c.onMessageEnd("assistant", [{ type: "text", text: "All done, files read." }]);
+    assert.ok(outcome !== null, "the swallowed nested block must still steer");
+    assert.equal(outcome?.action, "steer");
+    assert.equal(outcome?.nested, true);
+    assert.match(outcome?.reason ?? "", /codemode script was blocked/);
+    // One-shot: the next healthy message is not flagged again.
+    assert.equal(c.onMessageEnd("assistant", [{ type: "text", text: "Continuing work." }]), null);
+  });
+
+  it("steer-again waits for an assistant message and does not fire on user/toolResult ends", () => {
+    const c = createController();
+    c.onToolCall("read", { path: "a.ts" }, "p1/1", "p1");
+    c.onToolCall("read", { path: "a.ts" }, "p1/2", "p1"); // arms steerAgain
+    assert.equal(c.onMessageEnd("toolResult", [{ type: "text", text: "x" }]), null);
+    const outcome = c.onMessageEnd("assistant", [{ type: "text", text: "ok" }]);
+    assert.ok(outcome !== null && outcome.action === "steer" && outcome.nested === true);
+  });
+
+  it("reset clears the armed nested steer", () => {
+    const c = createController();
+    c.onToolCall("read", { path: "a.ts" }, "p1/1", "p1");
+    c.onToolCall("read", { path: "a.ts" }, "p1/2", "p1"); // arms steerAgain
+    c.reset(); // new user prompt
+    assert.equal(
+      c.onMessageEnd("assistant", [{ type: "text", text: "fresh start" }]),
+      null,
+      "armed steer must not survive a reset",
+    );
+  });
+
+  it("status reports nested codemode counters", () => {
+    const c = createController();
+    c.onToolCall("read", { path: "a.ts" }, "p1/1", "p1");
+    c.onToolCall("read", { path: "a.ts" }, "p1/2", "p1");
+    assert.match(c.status(), /nested: calls=1 blocks=1/);
+  });
+
+  it("adapter forwards parentToolCallId and sends NESTED_STEER_TEXT via sendMessage", () => {
+    const { pi, fire, sent } = makeFakePi();
+    indexDefault(pi);
+    const aborts: string[] = [];
+    const ctx = { ...fakeCtx(), abort: () => aborts.push("abort") };
+
+    // Two identical nested reads from one script → 2nd blocks (no abort).
+    fire(
+      "tool_call",
+      { toolName: "read", toolCallId: "p1/1", input: { path: "a.ts" }, parentToolCallId: "p1" },
+      ctx,
+    );
+    const blocked = fire(
+      "tool_call",
+      { toolName: "read", toolCallId: "p1/2", input: { path: "a.ts" }, parentToolCallId: "p1" },
+      ctx,
+    );
+    assert.ok(blocked && blocked.block === true, "2nd identical nested call must block");
+    assert.equal(aborts.length, 0, "first nested block does not abort");
+
+    // Script ends; assistant message_end → the armed nested steer fires.
+    fire(
+      "message_end",
+      { message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+      ctx,
+    );
+    assert.equal(sent.length, 1, "a steer message was sent");
+    assert.match(sent[0].content?.content ?? "", /codemode script repeated identical tool calls/);
+    assert.equal(sent[0].options?.deliverAs, "steer");
+
+    // A new script re-issuing the same signature escalates → abort.
+    fire(
+      "tool_call",
+      { toolName: "read", toolCallId: "p2/1", input: { path: "a.ts" }, parentToolCallId: "p2" },
+      ctx,
+    );
+    const esc = fire(
+      "tool_call",
+      { toolName: "read", toolCallId: "p2/2", input: { path: "a.ts" }, parentToolCallId: "p2" },
+      ctx,
+    );
+    assert.ok(esc && esc.block === true);
+    assert.equal(aborts.length, 1, "cross-script repeat escalates to abort");
+  });
+});

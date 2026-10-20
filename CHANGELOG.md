@@ -2,6 +2,39 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.0.12] — 2026-10-01
+
+### Added
+
+- **E2E tests against a real pi ≥ 0.99** (`tests/e2e/pi.test.ts` + `tests/e2e/pi-rig.ts`) — the rig downloads the real `@earendil-works/pi-coding-agent@0.99.2` (cached), runs pi's RPC entry headlessly with the repo extension loaded, and drives sessions with an in-process OpenAI-compatible fake LLM, fully offline. Verified: the extension blocks a scripted identical-`bash` doom loop in a real session; a **real codemode worker** executing a script that polls a file 5× inside ONE `codemode` call is blocked by the nested 2× rule and the script fails with the `BLOCKED by anti-doom-loop` reason; the recommended distinct `Promise.allSettled` batch completes untouched. Skips cleanly when the npm registry is unreachable. Run with `pnpm run e2e:pi`.
+- **Codemode nested-loop fixtures** — `codemodeNestedLoop` (in-script poll loop), `codemodeErrorRetryLoop` (identical retry after an in-script error), `codemodeCrossScriptRepeat` (second script re-issuing a blocked signature → escalation), and `codemodeHealthyBatch` (the documented `Promise.allSettled` pattern stays unblocked), each driven through the controller exactly as pi delivers nested events, plus a contrast test proving a 2× loop blocks nested while staying under the top-level 3× threshold.
+
+### Changed
+
+- **Tooling migrated to pnpm (latest, 12.8.1)** — `packageManager` pin, `pnpm-lock.yaml` with the default virtual store (`node_modules/.pnpm`), all scripts and docs use `pnpm`, the release workflow installs via `pnpm/action-setup` + `--frozen-lockfile` and publishes with `pnpm publish --no-git-checks`; the tarball e2e asserts via `pnpm pack` and pins the tooling.
+
+### Fixed
+
+- **Fresh installs failed under pnpm 12** — unapproved dependency build scripts made `pnpm install --frozen-lockfile` exit `ERR_PNPM_IGNORED_BUILDS`, which would have aborted the release workflow before the quality gate. The dev-only transitives pi pulls (`esbuild`, `protobufjs`, `@google/genai`) are now explicitly denied in `pnpm-workspace.yaml`; their binaries come from optional platform packages.
+- **`oxlint-tsgolint` pin had no matching artifact** — `package.json` asked for `7.0.2003` while `@effect/tsgo` ships its patched tsgolint for `7.0.2001` only. The devDependency now matches the artifact (the workspace override already pinned it), so `prepare` no longer looks for a missing binary.
+- **Bounded codemode memory** — a script's window now keeps only its most recent 100 calls (args are capped at 100 KB each), so a long-running script cannot pin unbounded memory; in-script loops repeat adjacent calls and still block at 2×.
+- **Real-pi e2e reported green when it never ran** — offline runs returned early from each test, which `node:test` records as passing. They now report `skipped`, so `pnpm test` can no longer claim coverage it did not execute.
+
+### Tests
+
+- 122 → 133: 4 real-pi e2e sessions, 6 codemode fixture tests, pnpm-pack artifact assertions, and the bounded nested-window case.
+
+## [0.0.11] — 2026-10-01
+
+### Added
+
+- **Codemode awareness (pi ≥ 0.99)** — pi's `codemode` tool runs model-written scripts that call other tools via `tools.<name>(args)`; those nested calls carry `parentToolCallId` in the `tool_call`/`tool_result` events and previously bypassed detection entirely (a script can issue hundreds of calls inside ONE top-level tool call). The extension now tracks them: identical calls inside one script block at **2×** (stricter than the top-level 3× — a repeated in-script call is never progress; store the result and reuse it), near-identical args count toward the same rule, and an identical retry of a call that already **errored** in the same script blocks immediately. Nested traffic is windowed **per script** and fully isolated from the top-level window in both directions. A NEW script re-issuing a signature blocked in an earlier script this prompt **escalates** (aborts the turn), mirroring top-level block escalation. `PI_ANTI_LOOP_TOOLS_EXCLUDE` applies to nested calls; nested identity is storage-capped (100 KB per call, most recent 100 calls per script) so huge payloads (whole-file reads) stay cheap; `/loopcheck` reports `nested: calls=N blocks=M`.
+- **The information wall** — a nested block reason reaches the _script_ as a tool error, not the model (pi delivers only the script's return value). If a script swallows block errors, the loop signal was lost. The extension now arms a one-shot **steer** on the next assistant `message_end` after any nested block, telling the model to call each tool once per script and reuse results — so a script that ignores tool errors can no longer silently eat the loop signal.
+
+### Tests
+
+- 99 → 122: nested unit semantics (2× rule, per-script isolation, error-retry, cross-script escalation, payload cap, exclude-list), adapter wiring (`parentToolCallId` forwarding, `NESTED_STEER_TEXT` via `sendMessage`, escalation aborts), and nested fuzz streams (never throw, injected in-script loops always block, random unique-args streams never false-positive).
+
 ## [0.0.10] — 2026-09-23
 
 ### Fixed

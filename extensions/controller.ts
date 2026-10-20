@@ -20,11 +20,15 @@ export interface ToolCallEventLite {
   toolName: string;
   toolCallId: string;
   input: unknown;
+  /** Set when another tool (for example a codemode script) issued this call (pi ≥ 0.99). */
+  parentToolCallId?: string;
 }
 export interface ToolResultEventLite {
   toolName: string;
   toolCallId: string;
   isError: boolean;
+  /** Set when another tool (for example a codemode script) issued this call (pi ≥ 0.99). */
+  parentToolCallId?: string;
 }
 export interface MessageEndEventLite {
   message: { role: string; content?: unknown };
@@ -54,6 +58,10 @@ export interface ToolCallOutcome {
   reason: string;
   /** True when this exact call was blocked before — caller should abort the turn. */
   escalate: boolean;
+  /** True for calls a codemode script made (`parentToolCallId` set, pi ≥ 0.99).
+   * Their block reason reaches the script as a tool error, not the model —
+   * the adapter must also steer so the model learns about the loop. */
+  nested?: boolean;
 }
 
 export interface TextLoopOutcome {
@@ -61,16 +69,29 @@ export interface TextLoopOutcome {
   action: "steer" | "abort";
   /** When aborting: also queue a single fresh-resume directive (bounded). */
   resume: boolean;
+  /** True when this steer surfaces a codemode script's swallowed nested block. */
+  nested?: boolean;
 }
 
 /** How many auto-resumes per session before we hand control back for real. */
 export const RESUME_BUDGET = 1;
 
 export interface AntiLoopController {
-  /** Returns a block decision for a tool call, or null to let it run. */
-  onToolCall(toolName: string, input: ToolInput, toolCallId: string): ToolCallOutcome | null;
+  /** Returns a block decision for a tool call, or null to let it run.
+   * `parentToolCallId` is set for calls a codemode script made (pi ≥ 0.99). */
+  onToolCall(
+    toolName: string,
+    input: ToolInput,
+    toolCallId: string,
+    parentToolCallId?: string,
+  ): ToolCallOutcome | null;
   /** Record a finished tool result (blocked calls' results are ignored). */
-  onToolResult(toolName: string, toolCallId: string, isError: boolean): void;
+  onToolResult(
+    toolName: string,
+    toolCallId: string,
+    isError: boolean,
+    parentToolCallId?: string,
+  ): void;
   /** Detect assistant-text loops; returns a steer/abort decision or null. */
   onMessageEnd(role: string, content: MessageContent): TextLoopOutcome | null;
   /** Full reset (session start, user prompt, /loopcheck reset). */
@@ -87,14 +108,39 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
   let detector = new LoopDetector(opts);
   const blockedIds = new Set<string>();
   let steered = false;
+  /** Nested (codemode) blocks seen but not yet surfaced to the model: scripts
+   * receive the block reason as a tool error, but only the script's return
+   * value reaches the model — the next message_end steers once so the loop
+   * signal is never swallowed by a script that ignores tool errors. */
+  let steerAgain = false;
   let resumes = 0;
   let steers = 0;
   let aborts = 0;
   let suspended = false;
 
   return {
-    onToolCall(toolName, input, toolCallId) {
+    onToolCall(toolName, input, toolCallId, parentToolCallId) {
       if (suspended) return null;
+      // Nested codemode calls (pi ≥ 0.99) take the stricter per-script path:
+      // they never enter the top-level window, so a script-level loop cannot
+      // hide from its own 3× top-level threshold.
+      if (parentToolCallId !== undefined) {
+        const nested = detector.checkNested(parentToolCallId, toolName, input);
+        if (nested.isErr()) {
+          detector.recordNested(parentToolCallId, toolName, toolCallId, input);
+          return null;
+        }
+        blockedIds.add(toolCallId);
+        // The block reason becomes the script's tool error, not the model's:
+        // arm the one-shot steer so the model still learns about the loop.
+        steerAgain = true;
+        return {
+          block: true,
+          reason: nested.value.reason,
+          escalate: nested.value.escalate,
+          nested: true,
+        };
+      }
       const decision = detector.check(toolName, input);
       if (decision.isErr()) {
         detector.record(toolName, input);
@@ -105,11 +151,15 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       return { block: true, reason: block.reason, escalate: block.escalate };
     },
 
-    onToolResult(toolName, toolCallId, isError) {
+    onToolResult(toolName, toolCallId, isError, parentToolCallId) {
       // Blocked calls never ran, so their (error) result must not count as a
       // consecutive failure.
       if (blockedIds.has(toolCallId)) {
         blockedIds.delete(toolCallId);
+        return;
+      }
+      if (parentToolCallId !== undefined) {
+        detector.recordNestedResult(parentToolCallId, toolCallId, isError);
         return;
       }
       detector.recordResult(toolName, isError);
@@ -128,6 +178,20 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
         .map((c) => ({ toolName: c.name ?? "", input: c.arguments as ToolInput }));
       const batch = detector.checkDuplicateCalls(calls);
       if (batch.isOk()) return { reason: batch.value.reason, action: "abort", resume: false };
+
+      // A nested codemode block may have been swallowed by the script (only
+      // its return value reaches the model): deliver the loop signal once.
+      if (steerAgain && !steered) {
+        steerAgain = false;
+        steered = true;
+        steers++;
+        return {
+          reason: "a codemode script was blocked for repeating tool calls inside itself",
+          action: "steer",
+          resume: false,
+          nested: true,
+        };
+      }
 
       const text = extractText(content);
       if (!text) return null;
@@ -154,6 +218,7 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       blockedIds.clear();
       steered = false;
       suspended = false;
+      steerAgain = false;
       // resumes/steers/aborts are intentionally NOT reset here: they are
       // session-scoped so a stuck model cannot cycle steer→abort forever and
       // /loopcheck can report lifetime counters.

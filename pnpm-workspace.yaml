@@ -1,0 +1,11 @@
+overrides:
+  # @effect/tsgo ships a patched tsgolint binary for exactly this version.
+  oxlint-tsgolint: 7.0.2001
+
+# pi (the peer dependency) pulls dev-only transitives with postinstall scripts
+# we never run: their binaries come from optional platform packages. Denying
+# them explicitly keeps `pnpm install --frozen-lockfile` non-interactive.
+allowBuilds:
+  "@google/genai": false
+  esbuild: false
+  protobufjs: false

@@ -26,9 +26,9 @@ async function node(args: string[], cwd = REPO, env: NodeJS.ProcessEnv = {}) {
   }
 }
 
-async function npm(args: string[], cwd = REPO, env: NodeJS.ProcessEnv = {}) {
+async function pnpm(args: string[], cwd = REPO, env: NodeJS.ProcessEnv = {}) {
   try {
-    const { stdout, stderr } = await run("npm", args, { cwd, env: { ...process.env, ...env } });
+    const { stdout, stderr } = await run("pnpm", args, { cwd, env: { ...process.env, ...env } });
     return { code: 0, stdout, stderr };
   } catch (err: any) {
     return { code: err.code ?? 1, stdout: err.stdout ?? "", stderr: err.stderr ?? "" };
@@ -72,7 +72,7 @@ describe("e2e: version guard subprocess", () => {
 });
 
 describe("e2e: published artifact", () => {
-  it("npm pack --dry-run includes extensions, scripts and the pi manifest", async () => {
+  it("pnpm pack --dry-run includes extensions, scripts and the pi manifest", async () => {
     const pkg = JSON.parse(await readFile(join(REPO, "package.json"), "utf8"));
 
     // files whitelist must cover every runtime/script source dir.
@@ -87,15 +87,14 @@ describe("e2e: published artifact", () => {
     assert.ok(pkg.keywords.includes("pi-package"), "pi-package keyword gate must be present");
     assert.equal(pkg.publishConfig?.access, "public");
     assert.equal(pkg.engines?.node, ">=22.18");
+    assert.match(String(pkg.packageManager ?? ""), /^pnpm@/, "tooling must stay pinned to pnpm");
 
     // Dry-run pack and confirm the tarball really contains the entrypoints.
-    // --ignore-scripts: npm pack runs prepublishOnly (= npm run check), which
+    // --ignore-scripts: pack runs prepublishOnly (= pnpm run check), which
     // would recursively invoke this test suite.
-    const { code, stdout } = await npm(["pack", "--dry-run", "--json", "--ignore-scripts"]);
+    const { code, stdout } = await pnpm(["pack", "--dry-run", "--json", "--ignore-scripts"]);
     assert.equal(code, 0);
-    // npm 12 returns an object keyed by package name instead of an array.
-    const parsed = JSON.parse(stdout.trim());
-    const pack = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
+    const pack = JSON.parse(stdout.trim());
     const files: string[] = pack.files.map((f: { path: string }) => f.path);
     for (const expected of [
       "extensions/index.ts",
@@ -111,11 +110,9 @@ describe("e2e: published artifact", () => {
   });
 
   it("test files and review tool state are excluded from the tarball", async () => {
-    const { code, stdout } = await npm(["pack", "--dry-run", "--json", "--ignore-scripts"]);
+    const { code, stdout } = await pnpm(["pack", "--dry-run", "--json", "--ignore-scripts"]);
     assert.equal(code, 0);
-    // npm 12 returns an object keyed by package name instead of an array.
-    const parsed = JSON.parse(stdout.trim());
-    const pack = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
+    const pack = JSON.parse(stdout.trim());
     const files: string[] = pack.files.map((f: { path: string }) => f.path);
     assert.ok(
       !files.some((f: string) => f.includes("/tests/") || f.startsWith("tests/")),
@@ -134,7 +131,7 @@ describe("e2e: quality gate scripts are wired", () => {
       }
       assert.match(pkg.scripts.test, /node --test/);
       assert.match(pkg.scripts.check, /oxlint --deny-warnings/);
-      assert.match(pkg.scripts.prepublishOnly, /npm run check/);
+      assert.match(pkg.scripts.prepublishOnly, /pnpm run check/);
     });
   });
 
