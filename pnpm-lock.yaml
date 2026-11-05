@@ -197,6 +197,9 @@ importers:
       oxlint-tsgolint:
         specifier: 7.0.2004
         version: 7.0.2004
+      typebox:
+        specifier: 1.3.27
+        version: 1.3.27
       typescript:
         specifier: ^7.0.2
         version: 7.0.2

@@ -75,7 +75,7 @@ describe("identical-call detection", () => {
     assert.ok(d.check("bash", { command: "cmd 0" }).isErr(), "evicted repeat does not count");
   });
 
-  it("accumulates wasted tokens on identical repeats and reports them in the block reason", () => {
+  it("accumulates the repeated-argument token count and reports it in the block reason", () => {
     const d = new LoopDetector(opts);
     const args = { command: "grep foo bar.ts" };
     d.check("bash", args);
@@ -84,13 +84,13 @@ describe("identical-call detection", () => {
     d.record("bash", args);
     const hit = d.check("bash", args);
     assert.ok(hit.isOk(), "3rd identical call blocks");
-    assert.ok(d.wastedTokensCount() > 0, "redundant repeats accumulate wasted tokens");
+    assert.ok(d.repeatArgTokensCount() > 0, "repeated args accumulate the token count");
     if (hit.isOk()) {
-      assert.match(hit.value.reason, /tokens burned on repeats/);
+      assert.match(hit.value.reason, /tokens of repeated arguments/);
     }
   });
 
-  it("diagnostics reports the wasted-token count", () => {
+  it("diagnostics reports the repeated-argument token count", () => {
     const d = new LoopDetector(opts);
     const args = { command: "grep foo bar.ts" };
     d.check("bash", args);
@@ -98,7 +98,7 @@ describe("identical-call detection", () => {
     d.check("bash", args);
     d.record("bash", args);
     d.check("bash", args);
-    assert.match(d.diagnostics(), /wastedTokens=\d+/);
+    assert.match(d.diagnostics(), /repeatArgTokens=\d+/);
   });
 
   it("evicts window entries older than the time window", () => {
@@ -273,7 +273,11 @@ describe("tool exclusion", () => {
       assert.ok(d.check("bash", { command: "grep foo" }).isErr(), "excluded tool must not block");
       d.record("bash", { command: "grep foo" });
     }
-    assert.equal(d.wastedTokensCount(), 0, "excluded calls never accumulate wasted tokens");
+    assert.equal(
+      d.repeatArgTokensCount(),
+      0,
+      "excluded calls never accumulate repeated-arg tokens",
+    );
     assert.match(d.diagnostics(), /calls\[0\]/, "excluded tool never enters the window");
 
     // A non-excluded tool's window is unaffected: identical repeats still block.
@@ -282,6 +286,49 @@ describe("tool exclusion", () => {
     d2.record("read", { path: "a" });
     const hit = d2.check("read", { path: "a" });
     assert.ok(hit.isOk(), "non-excluded tool still blocks on identical repeats");
+  });
+});
+
+describe("codemode scripts are not near-identical to each other (issue #8)", () => {
+  // The incident: three DIFFERENT one-off scripts bisecting a CSS bug, each a
+  // separate codemode call. They share JS boilerplate, so the token-overlap
+  // rule scored them ~0.69 — above the 0.55 near-identical bar — and the third
+  // call was blocked even though every script checked a different hypothesis.
+  const script = (stage: string, file: string) => ({
+    code: `const r = await tools.bash({ command: "node scripts/bisect.mjs --stage=${stage} --css=${file}" });\ntext(r.output);`,
+  });
+
+  it("near-identical scoring WOULD have fired — so the exemption is what protects the call", () => {
+    const a = canonical(script("a", "tailwind.css"));
+    const b = canonical(script("b", "app.css"));
+    const sim = argSimilarity(b, a);
+    assert.ok(sim !== null && sim >= NEAR_ARGS_SIMILARITY_THRESHOLD, `scores ${sim} (>= 0.55)`);
+  });
+
+  it("three distinct scripts in sequence are never blocked", () => {
+    const d = new LoopDetector(opts);
+    for (const [stage, file] of [
+      ["a", "tailwind.css"],
+      ["b", "app.css"],
+      ["c", "base.css"],
+      ["d", "reset.css"],
+    ] as const) {
+      const input = script(stage, file);
+      assert.ok(d.check("codemode", input).isErr(), `stage ${stage} must pass`);
+      d.record("codemode", input);
+    }
+  });
+
+  it("still blocks an identical script repeated — exact identity is not exempt", () => {
+    const d = new LoopDetector(opts);
+    const input = script("a", "tailwind.css");
+    d.check("codemode", input);
+    d.record("codemode", input);
+    d.check("codemode", input);
+    d.record("codemode", input);
+    const hit = d.check("codemode", input);
+    assert.ok(hit.isOk(), "the same script 3x must block");
+    if (hit.isOk()) assert.match(hit.value.reason, /identical arguments 3 times/);
   });
 });
 
@@ -737,5 +784,90 @@ describe("nested codemode calls (parentToolCallId, pi ≥ 0.99)", () => {
     assert.doesNotThrow(() => d.recordNestedResult("p1", "unknown-id", true));
     // And it must not arm the error-retry rule for anything.
     assert.ok(d.checkNested("p1", "bash", { command: "npm test" }).isErr());
+  });
+});
+
+describe("loop_ack: the agent overriding an intentional repeat", () => {
+  const gh = (command: string) => ({ command, cwd: "/w", timeout: 30 });
+  const CMD = gh("gh run view 123 --log-failed");
+
+  /** Block CMD by repeating it, and return the detector sitting on the block. */
+  const atBlock = () => {
+    const d = new LoopDetector(opts);
+    d.check("bash", CMD);
+    d.record("bash", CMD);
+    d.check("bash", CMD);
+    d.record("bash", CMD);
+    const hit = d.check("bash", CMD);
+    assert.ok(hit.isOk(), "precondition: the 3rd identical call blocks");
+    return d;
+  };
+
+  it("clears the block so the next identical call is allowed", () => {
+    const d = atBlock();
+    const ack = d.acknowledge();
+    assert.ok(ack.isOk(), "acknowledging a blocked repeat succeeds");
+    if (ack.isOk()) assert.equal(ack.value, "bash", "it names the tool it cleared");
+    assert.ok(d.check("bash", CMD).isErr(), "the same call is allowed after the ack");
+  });
+
+  it("is bounded: two acks allowed, the third refused", () => {
+    const d = atBlock();
+    assert.ok(d.acknowledge().isOk(), "1st ack");
+    d.record("bash", CMD);
+    d.record("bash", CMD);
+    d.check("bash", CMD);
+    assert.ok(d.acknowledge().isOk(), "2nd ack");
+    d.record("bash", CMD);
+    d.record("bash", CMD);
+    assert.ok(d.check("bash", CMD).isOk(), "re-blocked after the 2nd ack");
+    const third = d.acknowledge();
+    assert.ok(third.isErr(), "the 3rd ack is refused");
+    if (third.isErr()) assert.match(third.error, /would create the loop/);
+  });
+
+  it("refuses when nothing is blocked", () => {
+    const ack = new LoopDetector(opts).acknowledge();
+    assert.ok(ack.isErr());
+    if (ack.isErr()) assert.match(ack.error, /nothing is blocked/);
+  });
+
+  it("refuses a block whose reasons include failures", () => {
+    const d = new LoopDetector(opts);
+    // Three different commands failing: the repeat signal never fires, the
+    // failure streak does. That must not be acknowledgeable.
+    for (const c of ["npm test", "npm run lint", "npm run build"]) {
+      d.recordResult("bash", true);
+      d.check("bash", gh(c));
+    }
+    d.recordResult("bash", true);
+    const hit = d.check("bash", gh("npm run typecheck"));
+    assert.ok(hit.isOk(), "the failure streak blocks");
+    if (hit.isOk()) assert.doesNotMatch(hit.value.reason, /call loop_ack/, "no escape advertised");
+    const ack = d.acknowledge();
+    assert.ok(ack.isErr(), "a failure block cannot be acknowledged");
+    if (ack.isErr()) assert.match(ack.error, /failures/);
+  });
+
+  it("refuses a repeat that is also failing — a blind retry, not an intentional wait", () => {
+    const d = atBlock();
+    d.acknowledge();
+    d.recordResult("bash", true);
+    d.record("bash", CMD);
+    d.record("bash", CMD);
+    // The repeat fires again, but the tool is failing: no escape offered.
+    const hit = d.check("bash", CMD);
+    assert.ok(hit.isOk());
+    if (hit.isOk()) assert.doesNotMatch(hit.value.reason, /call loop_ack/);
+    const ack = d.acknowledge();
+    assert.ok(ack.isErr(), "a failing repeat cannot be acknowledged");
+    if (ack.isErr()) assert.match(ack.error, /failures/);
+  });
+
+  it("an ack survives nothing: reset clears it", () => {
+    const d = atBlock();
+    d.acknowledge();
+    d.reset();
+    assert.ok(d.acknowledge().isErr(), "nothing is blocked after a reset");
   });
 });

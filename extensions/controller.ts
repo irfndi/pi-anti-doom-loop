@@ -14,7 +14,6 @@
  */
 import { LoopDetector, readOptions } from "./detector.ts";
 import type { LoopOptions, ToolInput } from "./detector.ts";
-
 /** Minimal shapes of the pi events the controller consumes (structural). */
 export interface ToolCallEventLite {
   toolName: string;
@@ -76,6 +75,11 @@ export interface TextLoopOutcome {
 /** How many auto-resumes per session before we hand control back for real. */
 export const RESUME_BUDGET = 1;
 
+/** Result of an agent's `loop_ack`: the tool it cleared, or why it could not. */
+export type AcknowledgeOutcome =
+  | { acked: true; toolName: string }
+  | { acked: false; reason: string };
+
 export interface AntiLoopController {
   /** Returns a block decision for a tool call, or null to let it run.
    * `parentToolCallId` is set for calls a codemode script made (pi ≥ 0.99). */
@@ -94,6 +98,8 @@ export interface AntiLoopController {
   ): void;
   /** Detect assistant-text loops; returns a steer/abort decision or null. */
   onMessageEnd(role: string, content: MessageContent): TextLoopOutcome | null;
+  /** Let the last blocked call through because the agent states why. */
+  acknowledge(): AcknowledgeOutcome;
   /** Full reset (session start, user prompt, /loopcheck reset). */
   reset(): void;
   /** Suspend detection until the next reset (escape hatch for intentional repetition). */
@@ -222,6 +228,12 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       // resumes/steers/aborts are intentionally NOT reset here: they are
       // session-scoped so a stuck model cannot cycle steer→abort forever and
       // /loopcheck can report lifetime counters.
+    },
+
+    acknowledge() {
+      const result = detector.acknowledge();
+      if (result.isErr()) return { acked: false, reason: result.error };
+      return { acked: true, toolName: result.value };
     },
 
     suspend() {
