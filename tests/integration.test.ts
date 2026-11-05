@@ -21,6 +21,9 @@ function makeFakePi() {
     { description?: string; handler: (args: string, ctx: CommandCtxLite) => Promise<void> | void }
   >();
   const sent: Array<{ content: any; options?: any }> = [];
+  // Exactly what registerTool receives, so the fake needs no cast.
+  type ToolRegistration = Parameters<NonNullable<PiLike["registerTool"]>>[0];
+  const tools = new Map<string, ToolRegistration>();
   const pi: PiLike = {
     on(event, handler) {
       handlers.set(event, handler);
@@ -31,12 +34,16 @@ function makeFakePi() {
     sendMessage(content, options) {
       sent.push({ content, options });
     },
+    registerTool(definition) {
+      tools.set(definition.name, definition);
+    },
   };
   return {
     pi,
     handlers,
     commands,
     sent,
+    tools,
     fire: (event: string, e: any, c: any = {}) => {
       const h = handlers.get(event);
       assert.ok(h, `no handler registered for ${event}`);
@@ -523,5 +530,273 @@ describe("nested codemode calls (parentToolCallId, pi ≥ 0.99)", () => {
     );
     assert.ok(esc && esc.block === true);
     assert.equal(aborts.length, 1, "cross-script repeat escalates to abort");
+  });
+});
+
+describe("enable/disable at global and project level", () => {
+  // Pi deep-merges ~/.pi/agent/settings.json with <cwd>/.pi/settings.json, so
+  // the adapter only sees the merged result — one getSettings() read covers
+  // both scopes, with the project winning per key exactly as pi decides.
+  it("stays on when the setting is absent or malformed", () => {
+    const { pi, fire } = makeFakePi();
+    pi.getSettings = () => ({});
+    indexDefault(pi);
+    const ctx = fakeCtx();
+    const run = () => {
+      fire("tool_call", { toolName: "bash", toolCallId: "c1", input: { command: "sleep 1" } }, ctx);
+      fire("tool_call", { toolName: "bash", toolCallId: "c2", input: { command: "sleep 1" } }, ctx);
+      return fire(
+        "tool_call",
+        { toolName: "bash", toolCallId: "c3", input: { command: "sleep 1" } },
+        ctx,
+      );
+    };
+    assert.ok(run() && run() !== undefined, "absent setting keeps detection on");
+
+    // A typo must not silently disable loop detection. pi does not validate
+    // settings.json, so a hand-written string really can land in this member.
+    const d = makeFakePi();
+    // SAFETY: this stands in for a hand-edited settings.json, which pi loads
+    // without validation, so the file can hold a member the type forbids.
+    d.pi.getSettings = () => JSON.parse('{"antiDoomLoop":{"enabled":"false"}}');
+    indexDefault(d.pi);
+    const ctx2 = fakeCtx();
+    const call = (id: string) =>
+      d.fire(
+        "tool_call",
+        { toolName: "bash", toolCallId: id, input: { command: "sleep 1" } },
+        ctx2,
+      );
+    call("c1");
+    call("c2");
+    assert.ok(call("c3") !== undefined, "non-boolean enabled keeps detection on");
+  });
+
+  it("global settings.json disables detection entirely", () => {
+    const { pi, fire } = makeFakePi();
+    pi.getSettings = () => ({ antiDoomLoop: { enabled: false } });
+    indexDefault(pi);
+    const ctx = fakeCtx();
+    for (let i = 0; i < 10; i++) {
+      assert.equal(
+        fire(
+          "tool_call",
+          { toolName: "bash", toolCallId: `c${i}`, input: { command: "sleep 1" } },
+          ctx,
+        ),
+        undefined,
+        "disabled: no block, no escalation",
+      );
+    }
+    // Text loops are off too.
+    for (let i = 0; i < 5; i++) {
+      assert.equal(
+        fire(
+          "message_end",
+          { message: { role: "assistant", content: [{ type: "text", text: "Run the test." }] } },
+          ctx,
+        ),
+        undefined,
+      );
+    }
+  });
+
+  it("a project setting flipped mid-session takes effect on the next prompt", () => {
+    const { pi, fire } = makeFakePi();
+    let enabled = true;
+    pi.getSettings = () => ({ antiDoomLoop: { enabled } });
+    indexDefault(pi);
+    const ctx = fakeCtx();
+    const call = (id: string) =>
+      fire("tool_call", { toolName: "bash", toolCallId: id, input: { command: "sleep 1" } }, ctx);
+    call("c1");
+    call("c2");
+    assert.ok(call("c3") !== undefined, "enabled: the 3rd repeat blocks");
+
+    // User edits .pi/settings.json to disable, then sends the next prompt.
+    enabled = false;
+    fire("message_end", { message: { role: "user", content: [] } }, ctx);
+    for (let i = 0; i < 5; i++) {
+      assert.equal(call(`d${i}`), undefined, "disabled after the prompt reset");
+    }
+  });
+
+  it("works without getSettings (older hosts keep detecting)", () => {
+    const { pi, fire } = makeFakePi();
+    indexDefault(pi);
+    const ctx = fakeCtx();
+    const call = (id: string) =>
+      fire("tool_call", { toolName: "bash", toolCallId: id, input: { command: "sleep 1" } }, ctx);
+    call("c1");
+    call("c2");
+    assert.ok(call("c3") !== undefined, "no getSettings capability = detection on");
+  });
+
+  it("env switch is live, not load-time only", () => {
+    const { pi, fire } = makeFakePi();
+    indexDefault(pi);
+    const ctx = fakeCtx();
+    const call = (id: string) =>
+      fire("tool_call", { toolName: "bash", toolCallId: id, input: { command: "sleep 1" } }, ctx);
+    call("c1");
+    call("c2");
+    assert.ok(call("c3") !== undefined, "enabled before the switch");
+    process.env.PI_ANTI_LOOP_DISABLE = "1";
+    try {
+      assert.equal(call("c4"), undefined, "PI_ANTI_LOOP_DISABLE=1 applies immediately");
+    } finally {
+      delete process.env.PI_ANTI_LOOP_DISABLE;
+    }
+  });
+
+  it("/loopcheck suspend is a session-scoped switch; the prompt reset turns it back on", async () => {
+    const { pi, fire, commands } = makeFakePi();
+    indexDefault(pi);
+    const notices: string[] = [];
+    const ctx = { ...fakeCtx(), ui: { notify: (m: string, _l: string) => notices.push(m) } };
+    const call = (id: string) =>
+      fire("tool_call", { toolName: "bash", toolCallId: id, input: { command: "sleep 1" } }, ctx);
+    call("c1");
+    call("c2");
+    assert.ok(call("c3") !== undefined);
+    await commands.get("loopcheck")!.handler("suspend", ctx);
+    assert.match(notices.at(-1) ?? "", /suspended until the next prompt/);
+    assert.equal(call("c4"), undefined, "suspend suppresses blocks");
+
+    fire("message_end", { message: { role: "user", content: [] } }, ctx);
+    const again = (id: string) => call(id);
+    again("e1");
+    again("e2");
+    assert.ok(again("e3") !== undefined, "the next prompt re-enables detection");
+  });
+});
+
+describe("disable does not leak state into the re-enabled window", () => {
+  it("tool results during the off period do not seed a failure streak", () => {
+    const { pi, fire } = makeFakePi();
+    let enabled = false;
+    pi.getSettings = () => ({ antiDoomLoop: { enabled } });
+    indexDefault(pi);
+    const ctx = fakeCtx();
+
+    // While off, three failures land in the same tool.
+    for (let i = 0; i < 3; i++) {
+      fire(
+        "tool_call",
+        { toolName: "bash", toolCallId: `f${i}`, input: { command: `c${i}` } },
+        ctx,
+      );
+      fire("tool_result", { toolName: "bash", toolCallId: `f${i}`, isError: true }, ctx);
+    }
+
+    // Re-enable; a genuinely fresh call must not be blocked by the off period.
+    enabled = true;
+    fire("message_end", { message: { role: "user", content: [] } }, ctx);
+    assert.equal(
+      fire("tool_call", { toolName: "bash", toolCallId: "n1", input: { command: "fresh" } }, ctx),
+      undefined,
+      "no failure streak carried over from the off period",
+    );
+  });
+});
+
+describe("loop_ack tool through the adapter", () => {
+  const CMD = { command: "gh run view 123 --log-failed", cwd: "/w", timeout: 30 };
+  /** Repeat CMD three times via the fake; returns the 3rd call's block result. */
+  const loopToBlock = (rig: ReturnType<typeof makeFakePi>, ctx: ReturnType<typeof fakeCtx>) => {
+    for (const id of ["c1", "c2"]) {
+      rig.fire("tool_call", { toolName: "bash", toolCallId: id, input: CMD }, ctx);
+    }
+    return rig.fire("tool_call", { toolName: "bash", toolCallId: "c3", input: CMD }, ctx);
+  };
+
+  it("registers a loop_ack tool with a system-prompt snippet and guidelines", () => {
+    const { pi, tools } = makeFakePi();
+    indexDefault(pi);
+    const tool = tools.get("loop_ack");
+    assert.ok(tool, "loop_ack must be registered");
+    assert.match(tool.promptSnippet ?? "", /loop_ack/);
+    assert.ok(
+      (tool.promptGuidelines ?? []).some((g) => g.includes("repeated failures")),
+      "guidelines must warn against using it on failure blocks",
+    );
+  });
+
+  it("the block reason tells the agent to call loop_ack, and the ack unblocks the retry", () => {
+    const rig = makeFakePi();
+    indexDefault(rig.pi);
+    const ctx = fakeCtx();
+    const blocked = loopToBlock(rig, ctx);
+    assert.ok(blocked?.block === true, "3rd identical call blocks");
+    assert.match(blocked.reason, /call loop_ack/, "the reason advertises the escape hatch");
+
+    const result = rig.tools.get("loop_ack")!.execute("ack1", { why: "waiting on CI" });
+    assert.equal(result.details.acknowledged, true);
+    assert.equal(result.details.toolName, "bash");
+    assert.match(result.content[0].text, /cleared from the loop window/);
+
+    // The retry now runs.
+    assert.equal(
+      rig.fire("tool_call", { toolName: "bash", toolCallId: "c4", input: CMD }, ctx),
+      undefined,
+      "the acknowledged repeat is allowed",
+    );
+  });
+
+  it("refuses when nothing is blocked", () => {
+    const rig = makeFakePi();
+    indexDefault(rig.pi);
+    const result = rig.tools.get("loop_ack")!.execute("ack1", { why: "hypothetical" });
+    assert.equal(result.details.acknowledged, false);
+    assert.match(result.content[0].text, /nothing is blocked/);
+  });
+
+  it("refuses to acknowledge a failure block", () => {
+    const rig = makeFakePi();
+    indexDefault(rig.pi);
+    const ctx = fakeCtx();
+    for (const [i, c] of ["npm test", "npm run lint", "npm run build"].entries()) {
+      rig.fire("tool_call", { toolName: "bash", toolCallId: `f${i}`, input: { command: c } }, ctx);
+      rig.fire("tool_result", { toolName: "bash", toolCallId: `f${i}`, isError: true }, ctx);
+    }
+    const failing = { command: "npm run typecheck" };
+    const blocked = rig.fire(
+      "tool_call",
+      { toolName: "bash", toolCallId: "f9", input: failing },
+      ctx,
+    );
+    assert.ok(blocked?.block === true, "failure streak blocks");
+    assert.doesNotMatch(blocked.reason, /call loop_ack/, "no escape is advertised");
+
+    const result = rig.tools.get("loop_ack")!.execute("ack1", { why: "it will work eventually" });
+    assert.equal(result.details.acknowledged, false);
+    assert.match(result.content[0].text, /failures/);
+  });
+
+  it("a bounded number of acks stops an ack-and-retry loop", () => {
+    const rig = makeFakePi();
+    indexDefault(rig.pi);
+    const ctx = fakeCtx();
+    const ack = () => rig.tools.get("loop_ack")!.execute("a", { why: "still waiting" });
+
+    loopToBlock(rig, ctx);
+    assert.equal(ack().details.acknowledged, true);
+    loopToBlock(rig, ctx);
+    assert.equal(ack().details.acknowledged, true);
+    loopToBlock(rig, ctx);
+    const third = ack();
+    assert.equal(third.details.acknowledged, false, "the third ack is refused");
+    assert.match(third.content[0].text, /would create the loop/);
+  });
+
+  it("resets on the next user prompt", () => {
+    const rig = makeFakePi();
+    indexDefault(rig.pi);
+    const ctx = fakeCtx();
+    loopToBlock(rig, ctx);
+    assert.equal(rig.tools.get("loop_ack")!.execute("a", { why: "x" }).details.acknowledged, true);
+    rig.fire("message_end", { message: { role: "user", content: [] } }, ctx);
+    const afterReset = rig.tools.get("loop_ack")!.execute("b", { why: "x" });
+    assert.equal(afterReset.details.acknowledged, false, "nothing is blocked after a reset");
   });
 });

@@ -2,6 +2,25 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.0.15] — 2026-11-05
+
+### Fixed
+
+- **Exploratory codemode scripts were reported as a doom loop ([#8](https://github.com/irfndi/pi-anti-doom-loop/issues/8))** — two _different_ scripts share JS boilerplate (`const`, `await`, `tools`, `return`), so their shared-token score is ~0.69, above the 0.55 near-identical bar. Three sequential one-off scripts that each checked a different hypothesis were blocked on the third, exactly the shape `codemode` exists for. Scripts are now exempt from the top-level near-identical rule and compared by exact identity only: re-issuing the same script still blocks, and repeated calls _inside_ one script stay covered by the nested 2× rule, which is the real loop shape for this tool. `PI_ANTI_LOOP_TOOLS_EXCLUDE=codemode` is no longer the only way out, so nobody has to disable the true positive to stop the false one.
+- **Block reasons never said which earlier call matched** — the near-identical reason now names the closest earlier call and how much of it overlapped (`closest earlier call shares 69% of its tokens: "…"`), for both top-level and in-script blocks, so a caller can see immediately that stage C matched stage D and either vary the script or genuinely stop.
+- **The token figure claimed waste it could not know about** — the block reason said `~N tokens burned on repeats`, but for exploratory scripts each repeat produced a distinct result that advanced the work. It now reads `~N tokens of repeated arguments`, reports the same number in `/loopcheck`, and the counter is `repeatArgTokens` instead of `wastedTokens`. The figure sizes the repetition; the caller decides whether it was waste.
+
+### Added
+
+- **`loop_ack`: the agent can override an intentional repeat itself** — some repeats are correct (polling a job, waiting for a deploy, re-running one flaky step) and the reason lives in the agent's head, not in the arguments. A repeat block now names a `loop_ack` tool the agent calls with just a reason; the call it was just blocked on is cleared and the retry allowed, with no human in the loop and no workaround. It acts on the **last block**, so the agent never re-sends arguments the detector already has. Deliberately narrow: **failure blocks cannot be acknowledged** (the evidence is already in the transcript, so waving them through would delete the anti-blind-retry guard), the hint is **not offered for a repeat that is also failing**, an acknowledgement **keeps failure evidence** so a command that starts failing re-blocks, and one call can be acknowledged **twice per prompt** — otherwise `ack, retry, blocked, ack` becomes the loop it was meant to allow.
+- **Global and project disable** — `"antiDoomLoop": { "enabled": false }` in `~/.pi/agent/settings.json` turns the guard off everywhere; the same key in `<repo>/.pi/settings.json` turns it off for one project. Pi deep-merges the two files with the project winning per key, so either scope can override the other. Only an explicit `false` disables — a missing key, malformed value, or non-boolean keeps detection on, because a typo must never silently disable loop detection. The project scope requires project trust, and edits land on the next prompt without a restart.
+- **`PI_ANTI_LOOP_DISABLE` is now read per prompt** instead of once at load, so a long session honors it without a restart.
+
+### Changed
+
+- **`LoopDetector.wastedTokensCount()` → `repeatArgTokensCount()`** — the old name asserted a judgement the detector cannot make.
+- **E2E rig accepts extra pi CLI args** (`runPi({ args })`) so tests can trust a project workspace and exercise the project-scope setting for real.
+
 ## [0.0.14] — 2026-10-20
 
 ### Fixed

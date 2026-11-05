@@ -24,6 +24,7 @@ import {
   assistantEnds,
   toolResultEnds,
   resultText,
+  type FakeTurn,
 } from "./pi-rig.ts";
 
 let piRoot: string | undefined;
@@ -130,5 +131,176 @@ describe("e2e: codemode nested loop (real codemode worker)", () => {
     const text = resultText(codemodeResults[0]);
     assert.match(text, /Script completed/, "the healthy batch must complete");
     assert.doesNotMatch(text, /BLOCKED by anti-doom-loop/, "no block for distinct reads");
+  });
+});
+
+describe("e2e: issue #8 — exploratory codemode scripts are not a doom loop", () => {
+  it("runs three distinct scripts in sequence without a block", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    // Each script checks a different hypothesis, exactly the bisect shape the
+    // issue reports. They share enough JS boilerplate to score ~0.69 under the
+    // near-identical rule, so only the codemode exemption keeps them running.
+    const script = (stage: string) =>
+      `const r = await tools.bash({ command: "node -e 'console.log(\\"stage ${stage}\\")'" });\nreturn r.output;`;
+    const { events } = await runPi(piRoot, {
+      turns: [
+        { toolCalls: [{ name: "codemode", args: { code: script("a") } }] },
+        { toolCalls: [{ name: "codemode", args: { code: script("b") } }] },
+        { toolCalls: [{ name: "codemode", args: { code: script("c") } }] },
+        { text: "bisect done" },
+      ],
+    });
+    const results = toolResultEnds(events).filter((e) => e.message?.toolName === "codemode");
+    assert.equal(results.length, 3, "all three scripts ran");
+    for (const [i, r] of results.entries()) {
+      const text = resultText(r);
+      assert.doesNotMatch(text, /BLOCKED by anti-doom-loop/, `script ${i + 1} was not blocked`);
+      assert.match(text, /Script completed/, `script ${i + 1} completed`);
+    }
+  });
+});
+
+describe("e2e: global and project disable", () => {
+  // Three identical bash calls: the classic top-level repeat the guard exists for.
+  const loop: FakeTurn = { toolCalls: [{ name: "bash", args: { command: "echo loop-probe" } }] };
+
+  it("global settings.json turns the guard off", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const { events } = await runPi(piRoot, {
+      turns: [loop, loop, loop, { text: "done" }],
+      agentDirFiles: {
+        "settings.json": JSON.stringify({
+          defaultTools: ["+codemode"],
+          antiDoomLoop: { enabled: false },
+        }),
+      },
+    });
+    const results = toolResultEnds(events).map(resultText);
+    assert.ok(results.length >= 3, "all three calls ran");
+    assert.ok(
+      !results.some((r) => r.includes("BLOCKED by anti-doom-loop")),
+      `global disable must prevent the block, got: ${JSON.stringify(results)}`,
+    );
+  });
+
+  it("project .pi/settings.json turns the guard off", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const { events } = await runPi(piRoot, {
+      // A project file needs project trust, so the run is launched with --approve.
+      args: ["--approve"],
+      turns: [loop, loop, loop, { text: "done" }],
+      files: {
+        ".pi/settings.json": JSON.stringify({ antiDoomLoop: { enabled: false } }),
+      },
+    });
+    const results = toolResultEnds(events).map(resultText);
+    assert.ok(results.length >= 3, "all three calls ran");
+    assert.ok(
+      !results.some((r) => r.includes("BLOCKED by anti-doom-loop")),
+      `project disable must prevent the block, got: ${JSON.stringify(results)}`,
+    );
+  });
+
+  it("the project setting wins over an enabling global setting", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const { events } = await runPi(piRoot, {
+      args: ["--approve"],
+      turns: [loop, loop, loop, { text: "done" }],
+      agentDirFiles: {
+        "settings.json": JSON.stringify({
+          defaultTools: ["+codemode"],
+          antiDoomLoop: { enabled: true },
+        }),
+      },
+      files: { ".pi/settings.json": JSON.stringify({ antiDoomLoop: { enabled: false } }) },
+    });
+    const results = toolResultEnds(events).map(resultText);
+    assert.ok(
+      !results.some((r) => r.includes("BLOCKED by anti-doom-loop")),
+      "the project scope decides",
+    );
+  });
+
+  it("the guard still blocks by default (the switch is not on by accident)", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const { events } = await runPi(piRoot, {
+      turns: [loop, loop, loop, { text: "done" }],
+      env: { PI_ANTI_LOOP_REPEATS: "3" },
+    });
+    const results = toolResultEnds(events).map(resultText);
+    assert.ok(
+      results.some((r) => r.includes("BLOCKED by anti-doom-loop")),
+      `default must block, got: ${JSON.stringify(results)}`,
+    );
+  });
+});
+
+describe("e2e: loop_ack lets the agent override an intentional repeat", () => {
+  // The scenario the feature exists for: a call the agent means to repeat
+  // (polling a job) gets blocked, so it says why instead of arguing.
+  const CMD = { command: "echo poll-the-job" };
+
+  it("a blocked repeat is allowed after the agent calls loop_ack", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const { events } = await runPi(piRoot, {
+      turns: [
+        { toolCalls: [{ name: "bash", args: CMD }] },
+        { toolCalls: [{ name: "bash", args: CMD }] },
+        // 3rd identical call is blocked; the block reason offers loop_ack.
+        { toolCalls: [{ name: "bash", args: CMD }] },
+        {
+          toolCalls: [
+            {
+              name: "loop_ack",
+              args: { why: "polling the job until it finishes" },
+            },
+          ],
+        },
+        // The acknowledged repeat now runs.
+        { toolCalls: [{ name: "bash", args: CMD }] },
+        { text: "done" },
+      ],
+      env: { PI_ANTI_LOOP_REPEATS: "3" },
+    });
+    const results = toolResultEnds(events).map(resultText);
+    const blocked = results.filter((r) => r.includes("BLOCKED by anti-doom-loop"));
+    assert.ok(blocked.length >= 1, `expected a block, got: ${JSON.stringify(results)}`);
+    assert.ok(
+      blocked.some((r) => r.includes("call loop_ack")),
+      "the block reason must advertise loop_ack",
+    );
+
+    const acked = results.find((r) => r.includes("Acknowledged ("));
+    assert.ok(acked, `loop_ack must acknowledge, got: ${JSON.stringify(results)}`);
+    assert.match(acked, /cleared from the loop window/);
+  });
+
+  it("refuses a failure block, which is not an intentional repeat", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const failing = { command: "exit 1" };
+    const { events } = await runPi(piRoot, {
+      turns: [
+        { toolCalls: [{ name: "bash", args: failing }] },
+        { toolCalls: [{ name: "bash", args: failing }] },
+        { toolCalls: [{ name: "bash", args: failing }] },
+        {
+          toolCalls: [
+            {
+              name: "loop_ack",
+              args: { why: "it will work this time" },
+            },
+          ],
+        },
+        { text: "done" },
+      ],
+    });
+    const results = toolResultEnds(events).map(resultText);
+    const refusal = results.find((r) => r.includes("Not acknowledged"));
+    assert.ok(refusal, `loop_ack must refuse, got: ${JSON.stringify(results)}`);
+    assert.match(
+      refusal,
+      /cannot be acknowledged|nothing is blocked|failures/,
+      "a failing repeat must be refused, and the reason must name the failure",
+    );
   });
 });

@@ -52,11 +52,67 @@ Environment variables, read at session/prompt start:
 | `PI_ANTI_LOOP_FAIL_RATE`     | `0`     | Fail-rate block threshold `0..1` (`0` = disabled): block when a tool's error share of its in-window calls reaches this                             |
 | `PI_ANTI_LOOP_FAIL_RATE_MIN` | `3`     | Minimum calls before the fail-rate window can block                                                                                                |
 | `PI_ANTI_LOOP_TOOLS_EXCLUDE` | —       | Comma-separated tool names to disable detection for entirely (never block, never enter the window — applies to nested codemode calls too)          |
-| `PI_ANTI_LOOP_DISABLE`       | —       | Set to `1` to disable the extension entirely                                                                                                       |
+| `PI_ANTI_LOOP_DISABLE`       | —       | Set to `1` to disable the extension entirely; read per prompt, not only at load                                                                    |
+
+## When the agent needs to repeat anyway
+
+Some repeats are correct. Polling a job, waiting on a deploy to go green, or
+re-running one flaky step all mean calling the same thing again — and the reason
+lives in the agent's head, not in the arguments. Blocking those just forces a
+workaround.
+
+So a repeat block is **overridable by the agent itself**, through a `loop_ack`
+tool registered by this extension:
+
+1. A repeat block names it, in the block reason: _"If this repeat is
+   intentional … call loop_ack and say why."_
+2. The agent calls `loop_ack` with the reason.
+3. The call it just got blocked on is cleared from the window, and the retry
+   runs.
+
+It acts on the **last block**, so the agent never re-sends the arguments — the
+detector already has them.
+
+It is deliberately narrow:
+
+- **Only repeat blocks.** A block caused by repeated **failures** cannot be
+  acknowledged. There the evidence is already in the transcript, and waving it
+  through would remove the guard that stops blind retries.
+- **Not a repeat that is also failing.** If the tool has failed since its last
+  success, the block is a blind retry, and the hint is not offered at all.
+  An acknowledgement never erases failure evidence, so a command that starts
+  failing re-blocks.
+- **Bounded.** One call can be acknowledged twice, not more — otherwise
+  "ack, retry, blocked, ack" becomes the loop it was meant to allow.
+- **Reset with everything else** on the next user prompt.
+
+Prefer this over the disable switches when only one call is in question.
+
+## Turning it off
+
+Loosest to strictest — pick the scope you need:
+
+| Scope                        | How                                                                   | Effect                                          |
+| ---------------------------- | --------------------------------------------------------------------- | ----------------------------------------------- |
+| One blocked repeat           | the agent calls `loop_ack` with a reason (see above)                  | that signature is cleared and the retry allowed |
+| This session                 | `/loopcheck suspend`                                                  | off until the next prompt                       |
+| Global                       | `"antiDoomLoop": { "enabled": false }` in `~/.pi/agent/settings.json` | off in every project                            |
+| This project                 | `"antiDoomLoop": { "enabled": false }` in `<repo>/.pi/settings.json`  | off in this project only; needs project trust   |
+| Everywhere, incl. automation | `PI_ANTI_LOOP_DISABLE=1`                                              | off, for CI and scripts                         |
+
+Pi deep-merges the two `settings.json` files with the project winning per key,
+so a project can disable what global enables (and vice versa) without either
+file repeating the other. Only an explicit `false` disables: a missing key, a
+malformed value, or a non-boolean leaves detection on, because a typo must
+never silently turn off loop detection. The project scope only applies to a
+trusted project — pi does not read `.pi/settings.json` otherwise.
+
+Edit either file during a session and the change lands on the next prompt; no
+restart needed.
 
 ## Command
 
-- `/loopcheck` — show thresholds, counters (steers/aborts this session), suspend state, the current window contents (most-repeated recent calls and texts), wasted-token count, and the fail-rate/time-window/exclude config when enabled
+- `/loopcheck` — show thresholds, counters (steers/aborts this session), suspend state, the current window contents (most-repeated recent calls and texts), repeated-argument token count, and the fail-rate/time-window/exclude config when enabled
 - `/loopcheck reset` — clear counters
 - `/loopcheck suspend` — pause detection until the next prompt (escape hatch for intentional repetition)
 - `/loopcheck resume` — re-enable detection early
@@ -90,15 +146,27 @@ tracks them:
   escalates and aborts the turn, mirroring top-level block-escalation.
 
 Huge nested payloads (whole-file reads) are identity-capped (100 KB per call)
-and each script keeps only its most recent 100 calls, so memory stays bounded. `/loopcheck` reports `nested: calls=N blocks=M`. Disable with
-`PI_ANTI_LOOP_DISABLE=1` as usual.
+and each script keeps only its most recent 100 calls, so memory stays bounded. `/loopcheck` reports `nested: calls=N blocks=M`.
+
+**Scripts are exempt from the top-level near-identical rule.** Two _different_
+scripts share JS boilerplate (`const`, `await`, `tools`, `return`), so their
+shared-token score is ~0.7 — above the 0.55 near-identical bar. Sequential
+one-off scripts checking different hypotheses are normal exploration, not a
+loop, and the near-identical rule blocked them. They are therefore compared by
+exact identity only (the same script re-issued still blocks), while their real
+loop shape — repeated calls _inside_ one script — stays covered by the nested
+2× rule above. If a specific call is a deliberate repeat, the agent can clear it
+with `loop_ack`.
 
 ## Token-cost awareness
 
-The detector estimates tokens burned on redundant repeats (~4 chars/token) and
-reports `"~N tokens burned on repeats."` in tool-call block reasons. The
-cumulative wasted-token count also appears in `/loopcheck` status, so you can
-see how much a loop actually cost before it was stopped.
+The detector estimates the size of repeated argument text (~4 chars/token) and
+reports it as `"~N tokens of repeated arguments."` in tool-call block reasons.
+The cumulative count also appears in `/loopcheck` status.
+
+It is deliberately _not_ labelled "wasted": for an exploratory session, a
+repeat can be the productive move, and only the caller knows which. The figure
+sizes the repetition; it does not judge it.
 
 ## How it works
 

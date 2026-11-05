@@ -119,6 +119,63 @@ export interface BlockDecision {
   escalate: boolean;
 }
 
+/**
+ * Settings key this extension reads. Pi deep-merges `~/.pi/agent/settings.json`
+ * (global) with `<cwd>/.pi/settings.json` (project, project wins per key, and
+ * only for a trusted project), so this one key disables the guard at either
+ * scope without a config parser here. Editing it takes effect on the next
+ * prompt, because the adapter re-reads it on every reset.
+ */
+export const SETTINGS_KEY = "antiDoomLoop";
+
+/**
+ * The slice of pi's merged settings this extension reads. Pi's `Settings` is a
+ * superset and carries no such key, so the adapter declares the shape it
+ * consumes and only the members below are ever touched.
+ */
+export interface AntiDoomSettings {
+  readonly antiDoomLoop?: { readonly enabled?: boolean };
+}
+
+/**
+ * Effective on/off: only an explicit `false` disables the guard, so a missing,
+ * malformed, or non-boolean value keeps it on (a typo must never silently
+ * disable loop detection).
+ */
+export function settingsEnabled(settings: AntiDoomSettings): boolean {
+  return settings[SETTINGS_KEY]?.enabled !== false;
+}
+
+/**
+ * Tools whose arguments are a whole program/file body. Two DIFFERENT scripts
+ * share the language's boilerplate (`const`, `await`, `tools`, `return`), so
+ * token overlap scores ~0.7 between unrelated scripts and the near-identical
+ * rule fires on genuine exploration. Their real loop shape — repeating calls
+ * inside one script — is caught exactly by `checkNested`.
+ */
+export const NEAR_ARGS_EXEMPT: ReadonlySet<string> = new Set(["codemode"]);
+
+/**
+ * How many times one signature may be acknowledged per prompt. Both ends are
+ * needed: an agent needs a second ack when the first window refills, and a
+ * bound so "acknowledge, retry, get blocked, acknowledge" cannot become the
+ * loop it was meant to allow. Reset per prompt with the rest of the window.
+ */
+export const ACK_LIMIT = 2;
+
+/** The last block, kept so `loop_ack` can act on it without re-sending arguments. */
+interface LastBlock {
+  sig: string;
+  toolName: string;
+  /** False when a failure reason fired too — then repeating is a blind retry. */
+  overridable: boolean;
+}
+
+/** True when any reason came from the failure signals, not just repetition. */
+function hasFailureReason(reasons: readonly string[]): boolean {
+  return reasons.some((r) => r.includes("failed "));
+}
+
 /** Block reasons for one tool call: identical repeats, failure streak, failure rate. */
 function collectBlockReasons(
   toolName: string,
@@ -161,7 +218,7 @@ export class LoopDetector {
   private recentTexts: { text: string; ts: number }[] = [];
   private lastText: string | null = null;
   private textStreak = 0;
-  private wastedTokens = 0;
+  private repeatArgTokens = 0;
 
   // --- nested codemode calls (pi ≥ 0.99: `parentToolCallId` set) ---
   /** Per-parent (per-script) call windows, keyed by the parent tool-call id. */
@@ -174,8 +231,46 @@ export class LoopDetector {
   private nestedErrorSigs = new Map<string, Set<string>>();
   private nestedCallCount = 0;
 
+  /** The most recent block, so `loop_ack` acts on it without re-sending arguments. */
+  private lastBlock: LastBlock | null = null;
+  /**
+   * Acks per signature. Must outlive a block: acknowledging clears the window, so
+   * the same call blocks again on its next repeat and the count has to carry over
+   * for the limit to bound anything.
+   */
+  private acksBySig = new Map<string, number>();
+
   constructor(opts: LoopOptions = DEFAULT_OPTIONS) {
     this.opts = opts;
+  }
+
+  /**
+   * Let the last blocked call through: drop its window entries so the repetition
+   * count restarts, and allow the next call. Returns the tool it cleared, or why
+   * it cannot be overridden.
+   */
+  acknowledge(): Result<string, string> {
+    const block = this.lastBlock;
+    if (block === null) {
+      return Result.err(
+        "nothing is blocked right now, so there is nothing to acknowledge. Just call it.",
+      );
+    }
+    if (!block.overridable) {
+      return Result.err(
+        `the last block reports failures, not just a repeat, so repeating the call will not help — fix the failure or ask the user.`,
+      );
+    }
+    const acks = this.acksBySig.get(block.sig) ?? 0;
+    if (acks >= ACK_LIMIT) {
+      return Result.err(
+        `already acknowledged ${acks} times; acknowledging again would create the loop it was meant to allow. Change the approach.`,
+      );
+    }
+    this.acksBySig.set(block.sig, acks + 1);
+    this.recentSigs = this.recentSigs.filter((s) => s.sig !== block.sig);
+    this.blockedBySig.delete(block.sig);
+    return Result.ok(block.toolName);
   }
 
   check(toolName: string, input: ToolInput): Result<BlockDecision, undefined> {
@@ -189,9 +284,9 @@ export class LoopDetector {
     const repeats = this.recentSigs.filter((s) => s.sig === sig).length;
     const total = repeats + 1; // including this call
 
-    // Rough cost accounting (feature B): every redundant repeat of an already
-    // present signature burns tokens with no new information.
-    if (repeats >= 1) this.wastedTokens += estimateTokens(stringify(input));
+    // Rough accounting of the repeated argument text (not "tokens saved": the
+    // caller decides whether a repeat was waste).
+    if (repeats >= 1) this.repeatArgTokens += estimateTokens(stringify(input));
 
     const reasons = collectBlockReasons(
       toolName,
@@ -205,30 +300,35 @@ export class LoopDetector {
     // label, tail flags, timeouts) never repeats a signature. Production data:
     // 7 of 9 commands repeated ≥3× in a live session had fully distinct args
     // with an identical `command`. Same tool + ≥55% shared arg tokens still
-    // counts as a repeat.
+    // counts as a repeat. Whole-program args are exempt (NEAR_ARGS_EXEMPT).
     if (reasons.length === 0) {
-      const near = this.nearRepeats(toolName, args);
-      if (near >= 1) this.wastedTokens += estimateTokens(stringify(input));
-      if (near + 1 >= this.opts.repeatThreshold) {
-        reasons.push(
-          `"${toolName}" was called with near-identical arguments ${near + 1} times in the last ${this.opts.windowSize} tool calls (only minor changes)`,
-        );
-      }
+      const nearReason = this.nearRepeatReason(toolName, args, input);
+      if (nearReason !== null) reasons.push(nearReason);
     }
 
     if (reasons.length === 0) return Result.err(undefined);
+    return Result.ok(this.block(toolName, sig, reasons));
+  }
 
+  /** Record the block, and return the decision the model sees. */
+  private block(toolName: string, sig: string, reasons: string[]): BlockDecision {
     const blockedCount = (this.blockedBySig.get(sig) ?? 0) + 1;
     this.blockedBySig.set(sig, blockedCount);
-    const cost = this.wastedTokens > 0 ? ` ~${this.wastedTokens} tokens burned on repeats.` : "";
-
-    return Result.ok({
-      reason:
-        reasons.join("; ") +
-        cost +
-        `. BLOCKED by anti-doom-loop — you appear to be looping. Change your approach, use a different tool, or ask the user.`,
+    // Only a pure repeat may be overridden, and only while the tool is not
+    // failing: a repeat of something broken is a blind retry, and the repeat
+    // rule fires before the failure streak reaches its own threshold. Deciding
+    // here means `loop_ack` never has to re-derive it.
+    const overridable = this.consecutiveFails(toolName) === 0 && !hasFailureReason(reasons);
+    this.lastBlock = { sig, toolName, overridable };
+    const cost =
+      this.repeatArgTokens > 0 ? ` ~${this.repeatArgTokens} tokens of repeated arguments.` : "";
+    const escape = overridable
+      ? " If this repeat is intentional (waiting on an external change, polling a job), call loop_ack and say why."
+      : "";
+    return {
+      reason: `${reasons.join("; ")}${cost}. BLOCKED by anti-doom-loop — you appear to be looping. Change your approach, use a different tool, or ask the user.${escape}`,
       escalate: blockedCount > 1,
-    });
+    };
   }
 
   record(toolName: string, input: ToolInput): void {
@@ -340,6 +440,15 @@ export class LoopDetector {
     return n;
   }
 
+  /** The near-identical block reason, or null. Counts this call's arg tokens as repeated. */
+  private nearRepeatReason(toolName: string, args: string, input: ToolInput): string | null {
+    if (NEAR_ARGS_EXEMPT.has(toolName)) return null;
+    const near = this.nearRepeats(toolName, args);
+    if (near >= 1) this.repeatArgTokens += estimateTokens(stringify(input));
+    if (near + 1 < this.opts.repeatThreshold) return null;
+    return `"${toolName}" was called with near-identical arguments ${near + 1} times in the last ${this.opts.windowSize} tool calls (only minor changes)`;
+  }
+
   recordResult(toolName: string, error: boolean): void {
     this.recentResults.push({ tool: toolName, error, ts: Date.now() });
     this.evictResults();
@@ -380,7 +489,7 @@ export class LoopDetector {
     this.recentTexts.push({ text: norm, ts: Date.now() });
     this.evictTexts();
     if (this.recentTexts.filter((t) => t.text === norm).length >= 2) {
-      this.wastedTokens += estimateTokens(norm);
+      this.repeatArgTokens += estimateTokens(norm);
     }
     if (exactCount >= this.opts.textRepeatThreshold) {
       return Result.ok({
@@ -503,9 +612,9 @@ export class LoopDetector {
     while (this.recentTexts.length > this.opts.windowSize) this.recentTexts.shift();
   }
 
-  /** Estimated tokens burned on redundant repeats (feature B). */
-  wastedTokensCount(): number {
-    return this.wastedTokens;
+  /** Estimated tokens spent on repeated argument text (feature B). */
+  repeatArgTokensCount(): number {
+    return this.repeatArgTokens;
   }
 
   /** Human-readable window introspection for /loopcheck (feature F). */
@@ -530,7 +639,7 @@ export class LoopDetector {
     return (
       `calls[${this.recentSigs.length}] ${topSigs || "none"}; ` +
       `texts[${this.recentTexts.length}] ${topTexts || "none"}; ` +
-      `wastedTokens=${this.wastedTokens}; ` +
+      `repeatArgTokens=${this.repeatArgTokens}; ` +
       `nested: calls=${nested.calls} blocks=${nested.blocks}`
     );
   }
@@ -542,12 +651,14 @@ export class LoopDetector {
     this.recentTexts = [];
     this.lastText = null;
     this.textStreak = 0;
-    this.wastedTokens = 0;
+    this.repeatArgTokens = 0;
     this.nestedSigs.clear();
     this.nestedIds.clear();
     this.nestedBlockedBySig.clear();
     this.nestedErrorSigs.clear();
     this.nestedCallCount = 0;
+    this.lastBlock = null;
+    this.acksBySig.clear();
   }
 
   summary(): string {

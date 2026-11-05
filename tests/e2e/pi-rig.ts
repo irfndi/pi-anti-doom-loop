@@ -207,8 +207,15 @@ export interface PiRunOptions {
   files?: Record<string, string>;
   /** Extra files created in the agent dir (e.g. settings.json for defaultTools). */
   agentDirFiles?: Record<string, string>;
+  /** Extra pi CLI args, e.g. `--approve` to trust the workspace's `.pi` settings. */
+  args?: string[];
   /** Hard deadline for the whole session. */
   timeoutMs?: number;
+}
+
+/** pi CLI args for a headless run: fixed flags plus any per-test extras. */
+function piArgs(rpcEntry: string, extPath: string, extra: string[] = []): string[] {
+  return [rpcEntry, "--no-session", "--model", "fake/loop-bot", "-e", extPath, ...extra];
 }
 
 /**
@@ -251,21 +258,17 @@ export async function runPi(piRoot: string, options: PiRunOptions): Promise<PiRu
     await writeFile(join(workspace, name), content);
   }
 
-  const child = spawn(
-    process.execPath,
-    [rpcEntry, "--no-session", "--model", "fake/loop-bot", "-e", extPath],
-    {
-      cwd: workspace,
-      env: {
-        ...process.env,
-        PI_CODING_AGENT_DIR: agentDir,
-        PI_OFFLINE: "1",
-        PI_SKIP_VERSION_CHECK: "1",
-        ...options.env,
-      },
-      stdio: ["pipe", "pipe", "pipe"],
+  const child = spawn(process.execPath, piArgs(rpcEntry, extPath, options.args), {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_OFFLINE: "1",
+      PI_SKIP_VERSION_CHECK: "1",
+      ...options.env,
     },
-  );
+    stdio: ["pipe", "pipe", "pipe"],
+  });
 
   // Feed one prompt; end stdin once the run settles (pi exits on EOF) —
   // with a fallback so a hung session still terminates.

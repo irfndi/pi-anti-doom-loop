@@ -16,6 +16,16 @@
  *    or a sentence repeated inside ONE message → steer first, abort as
  *    escalation, then a bounded auto-resume so work continues
  *
+ * Per-block escape hatch: the agent calls `loop_ack` to clear the repeat it was
+ * just blocked on, when the reason lives in its head rather than the arguments.
+ *
+ * Off switches, most to least specific:
+ *  - `{ "antiDoomLoop": { "enabled": false } }` in `~/.pi/agent/settings.json`
+ *    (global) or `<cwd>/.pi/settings.json` (project; project wins, and pi only
+ *    honors it for a trusted project). Read live on every prompt.
+ *  - `PI_ANTI_LOOP_DISABLE=1` (environment, for CI and automation).
+ *  - `/loopcheck suspend` / `/loopcheck resume` for the current session.
+ *
  * Escalation (message loops): detection #1 steers the agent mid-run; #2
  * aborts the turn and queues one fresh-resume directive; #3+ aborts for real
  * and hands control back to the user. Tool-call blocks hand the model an
@@ -26,8 +36,7 @@
  * a task legitimately repeated later in the session is never a false positive.
  * Run restarts (auto-continue, steers/resumes, async-result drains) do NOT
  * reset — hosts emit `before_agent_start` on every run start, and resetting
- * there wiped counters between the iterations of cross-run loops. Disable with
- * PI_ANTI_LOOP_DISABLE=1.
+ * there wiped counters between the iterations of cross-run loops.
  *
  * All logic lives in `controller.ts` (pure, pi-free, unit-tested); this file
  * is a thin adapter wiring it to pi's event loop. The pi API is consumed
@@ -43,7 +52,8 @@ import {
   type ToolCallEventLite,
   type ToolResultEventLite,
 } from "./controller.ts";
-import { readOptions, type ToolInput } from "./detector.ts";
+import { readOptions, settingsEnabled, type AntiDoomSettings, type ToolInput } from "./detector.ts";
+import { Type, type Static, type TSchema } from "typebox";
 
 /** What an event handler hands back to pi: a tool-call block decision, or nothing.
  * Mirrors pi's own `ExtensionHandler<E, R>` contract (`Promise<R | void> | R | void`)
@@ -68,6 +78,39 @@ export interface PiLike {
     content: { customType?: string; content?: string; display?: boolean },
     options?: { deliverAs?: "steer" | "followUp" | "nextTurn"; triggerTurn?: boolean },
   ): void;
+  /** Effective settings, global deep-merged with project (project wins). */
+  getSettings?(): AntiDoomSettings;
+  /**
+   * Register a tool the model can call. Structural on purpose: pi validates
+   * arguments against `parameters` before `execute`, so this declares only the
+   * members this extension reads.
+   */
+  registerTool?(definition: {
+    name: string;
+    label: string;
+    description: string;
+    promptSnippet?: string;
+    promptGuidelines?: string[];
+    parameters: TSchema;
+    execute(toolCallId: string, params: AckParams): ToolResult;
+  }): void;
+}
+
+/** `loop_ack` parameters: just the reason. The detector already knows the call. */
+const ACK_PARAMS = Type.Object({
+  why: Type.String({
+    description:
+      "Why repeating the blocked call is intentional, for example 'waiting for the deploy to finish before re-running the test'",
+  }),
+});
+
+/** Arguments `loop_ack` receives after pi validates them against ACK_PARAMS. */
+type AckParams = Static<typeof ACK_PARAMS>;
+
+/** The shape every tool result has: text the model reads, plus details. */
+interface ToolResult {
+  content: { type: "text"; text: string }[];
+  details: { acknowledged: boolean; toolName?: string };
 }
 
 /** Injected on the first loop detection — steer the agent back on track. */
@@ -89,14 +132,25 @@ const RESUME_TEXT =
   "Start over with a genuinely different approach: do not repeat the previous investigation steps. " +
   "Re-read the task, choose one new action, execute it, then report results.";
 
-export default function (pi: PiLike): void {
-  if (process.env.PI_ANTI_LOOP_DISABLE === "1") return;
+/** Uniform `loop_ack` result: the text the model reads, plus machine-readable details. */
+function ackResult(acknowledged: boolean, text: string, toolName?: string): ToolResult {
+  return { content: [{ type: "text", text }], details: { acknowledged, toolName } };
+}
 
+export default function (pi: PiLike): void {
+  // Env switch is checked per prompt too, so a long session honors a restartless
+  // change and CI can set it after load.
+  const envDisabled = (): boolean => process.env.PI_ANTI_LOOP_DISABLE === "1";
+  const settingsOff = (): boolean => {
+    const settings = pi.getSettings?.();
+    return settings !== undefined && !settingsEnabled(settings);
+  };
   let controller: AntiLoopController = createController(readOptions());
 
   pi.on("session_start", () => reset());
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
+    if (envDisabled() || settingsOff()) return;
     // SAFETY: pi delivers JSON-safe tool arguments, which is exactly the ToolInput domain.
     // Decode them into the ToolInput domain type at this I/O boundary before the controller sees them.
     const outcome = controller.onToolCall(
@@ -114,6 +168,9 @@ export default function (pi: PiLike): void {
   });
 
   pi.on("tool_result", (event: ToolResultEventLite) => {
+    // Skip while off: results of an off period must not seed a failure streak
+    // that fires the moment detection comes back on.
+    if (envDisabled() || settingsOff()) return;
     controller.onToolResult(
       event.toolName,
       event.toolCallId,
@@ -135,9 +192,10 @@ export default function (pi: PiLike): void {
     // `role:"user"` input messages are emitted with the run's input messages
     // (agent-core `emitInputMessages`) on omp and pi alike.
     if (event.message.role === "user") {
-      controller.reset();
+      reset();
       return;
     }
+    if (envDisabled() || settingsOff()) return;
     // SAFETY: pi delivers message content as JSON-safe blocks matching MessageContent.
     // Decode the untyped message content into MessageContent at this boundary.
     const outcome = controller.onMessageEnd(
@@ -164,6 +222,36 @@ export default function (pi: PiLike): void {
         { deliverAs: "followUp", triggerTurn: true },
       );
     }
+  });
+
+  // The agent's own escape hatch. A blocked call names it, and a stated reason
+  // the arguments cannot carry is the one thing only the agent knows.
+  pi.registerTool?.({
+    name: "loop_ack",
+    label: "Acknowledge intentional repeat",
+    description:
+      "Allow the repeated tool call that anti-doom-loop just blocked, when the repeat is " +
+      "intentional (polling a job, waiting on a deploy, re-running a flaky step). Say why, and " +
+      "that call is cleared from the loop window so the retry is allowed. Only repeat blocks can " +
+      "be acknowledged; a block for repeated failures cannot — fix the failure instead.",
+    promptSnippet: "loop_ack — allow one loop-blocked repeat with a stated reason",
+    promptGuidelines: [
+      "When anti-doom-loop blocks a call and the repeat is intentional (waiting on an external change, polling a job), call loop_ack with the reason instead of re-arguing the call.",
+      "Never call loop_ack to get past a block caused by repeated failures: fix the failure or ask the user.",
+    ],
+    parameters: ACK_PARAMS,
+    execute(_toolCallId, params) {
+      const outcome = controller.acknowledge();
+      if (!outcome.acked) {
+        return ackResult(false, `Not acknowledged: ${outcome.reason}`);
+      }
+      return ackResult(
+        true,
+        `Acknowledged (${params.why}). ${outcome.toolName} is cleared from the loop window — ` +
+          `retry it now. Two acknowledgements per block are allowed, a third is not.`,
+        outcome.toolName,
+      );
+    },
   });
 
   pi.registerCommand("loopcheck", {
