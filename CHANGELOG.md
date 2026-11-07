@@ -2,6 +2,31 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.0.16] — 2026-11-07
+
+### Added
+
+- **`docs/state-machines.md`** — every explicit and implicit state machine (prompt window, block/escalation, `loop_ack`, failure streak, text ladder, per-script codemode windows, enablement, release gate) with states, invariants, transition tables, and the invalid transitions the code could reach. Ships in the tarball.
+
+### Fixed
+
+- **A failure block latched the tool for the rest of the prompt** ([M4](docs/state-machines.md#m4--failure-streak)) — a blocked call never runs, so no result could clear the streak: a different, healthy `bash` command stayed blocked. The block now consumes the failure run; a model that keeps failing re-earns it.
+- **The auto-resume budget came back on every user prompt** ([M1](docs/state-machines.md#m1--prompt-window)) — the adapter rebuilt the controller, resetting the session-scoped budget. A prompt now resets detector state only; `session_start` replaces the controller.
+- **Suspension recorded half of every event pair** ([M7](docs/state-machines.md#m7--guard-enablement)) — results were recorded while calls were not, so off-period failures blocked the first call after `/loopcheck resume`.
+- **Stale escalation aborted a healthy turn** ([M2](docs/state-machines.md#m2--signature-block-and-escalation)) — `blockedBySig` outlived its window, so a later unrelated loop escalated on its first block.
+- **One block could be acknowledged twice** ([M3](docs/state-machines.md#m3--acknowledgement-loop_ack)) — `lastBlock` was never consumed, and a nested block left the previous one ackable.
+- **A text steer starved the codemode steer** ([M5](docs/state-machines.md#m5--assistant-text-ladder)) — a swallowed nested block was never surfaced once the text ladder had steered.
+- **Finished codemode windows were never dropped** ([M6](docs/state-machines.md#m6--nested-codemode-script-windows)) — 200 scripts of 90 KB args held 833 MB in one prompt. The window dies with its parent result, live windows are capped at 8, and each call stores at most 4 KB of args.
+- **A short `PI_ANTI_LOOP_WINDOW` silently disabled signals** ([M1](docs/state-machines.md#m1--prompt-window)) — the window is now raised to the largest configured threshold.
+- **The duplicate-batch abort was not counted** — `/loopcheck` reported `aborts=0` after aborting a spammed batch.
+- **`loop_ack` did not work on the blocks that actually need it** — a near-identical block clears only on a signature that never repeats, so acknowledging it left the whole cluster in the window and the very next retry re-blocked, forever. An ack now clears every window entry the block fired on (the exact signature plus each near-identical entry).
+- **The ack budget was per signature, so it bounded nothing a drifting loop does** — the loop it exists to stop changes its args on every retry, which refilled the per-signature allowance and made "ack, retry, blocked, ack" unlimited. Acks are counted per tool, so the second retry of one tool in one prompt is the ceiling.
+
+### Changed
+
+- **`AcknowledgeOutcome` names the tool, not a call** — `acksBySig`/`acksByTool` follow; `loop_ack` says "two acknowledgements per tool per prompt".
+- **`PI_ANTI_LOOP_WINDOW` is a floor, not an override** — it can be raised by any threshold it would otherwise make unreachable.
+
 ## [0.0.15] — 2026-11-05
 
 ### Fixed
@@ -210,6 +235,7 @@ All notable changes to **pi-anti-doom-loop**.
 - GitHub Actions release workflow: quality gate → version bump guard → dry-run → publish, triggered by `v*` tags.
 - `pi-package` keyword + `pi` manifest for the pi.dev gallery.
 
+[0.0.16]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.15...v0.0.16
 [0.0.7]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.4...v0.0.5

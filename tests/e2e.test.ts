@@ -101,6 +101,7 @@ describe("e2e: published artifact", () => {
       "extensions/controller.ts",
       "extensions/detector.ts",
       "scripts/guard-publish.ts",
+      "docs/state-machines.md",
       "package.json",
       "README.md",
       "LICENSE",

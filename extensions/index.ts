@@ -147,7 +147,9 @@ export default function (pi: PiLike): void {
   };
   let controller: AntiLoopController = createController(readOptions());
 
-  pi.on("session_start", () => reset());
+  pi.on("session_start", () => {
+    controller = createController(readOptions());
+  });
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
     if (envDisabled() || settingsOff()) return;
@@ -248,7 +250,7 @@ export default function (pi: PiLike): void {
       return ackResult(
         true,
         `Acknowledged (${params.why}). ${outcome.toolName} is cleared from the loop window — ` +
-          `retry it now. Two acknowledgements per block are allowed, a third is not.`,
+          `retry it now. Two acknowledgements per tool per prompt are allowed, a third is not.`,
         outcome.toolName,
       );
     },
@@ -278,6 +280,7 @@ export default function (pi: PiLike): void {
   });
 
   function reset(): void {
-    controller = createController(readOptions());
+    // Keep the controller: the auto-resume budget is session-scoped.
+    controller.reset();
   }
 }
