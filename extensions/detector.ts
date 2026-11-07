@@ -65,14 +65,25 @@ export function readOptions(env: Record<string, string | undefined> = process.en
       .map((s) => s.trim())
       .filter(Boolean),
   );
+  const repeatThreshold = num("PI_ANTI_LOOP_REPEATS", DEFAULT_OPTIONS.repeatThreshold);
+  const failThreshold = num("PI_ANTI_LOOP_FAILS", DEFAULT_OPTIONS.failThreshold);
+  const failRateMinCalls = num("PI_ANTI_LOOP_FAIL_RATE_MIN", DEFAULT_OPTIONS.failRateMinCalls);
+  const textRepeatThreshold = num("PI_ANTI_LOOP_TEXT_REPEATS", DEFAULT_OPTIONS.textRepeatThreshold);
   return {
-    repeatThreshold: num("PI_ANTI_LOOP_REPEATS", DEFAULT_OPTIONS.repeatThreshold),
-    failThreshold: num("PI_ANTI_LOOP_FAILS", DEFAULT_OPTIONS.failThreshold),
-    windowSize: num("PI_ANTI_LOOP_WINDOW", DEFAULT_OPTIONS.windowSize),
-    textRepeatThreshold: num("PI_ANTI_LOOP_TEXT_REPEATS", DEFAULT_OPTIONS.textRepeatThreshold),
+    repeatThreshold,
+    failThreshold,
+    // A shorter window makes a threshold unreachable, silently disabling it.
+    windowSize: Math.max(
+      num("PI_ANTI_LOOP_WINDOW", DEFAULT_OPTIONS.windowSize),
+      repeatThreshold - 1,
+      failThreshold,
+      failRateMinCalls,
+      textRepeatThreshold - 1,
+    ),
+    textRepeatThreshold,
     timeWindowMs: Number.isFinite(timeWindow) && timeWindow >= 0 ? timeWindow : 0,
     failRateThreshold: Number.isFinite(failRate) ? Math.min(1, Math.max(0, failRate)) : 0,
-    failRateMinCalls: num("PI_ANTI_LOOP_FAIL_RATE_MIN", DEFAULT_OPTIONS.failRateMinCalls),
+    failRateMinCalls,
     toolExclude,
   };
 }
@@ -156,10 +167,8 @@ export function settingsEnabled(settings: AntiDoomSettings): boolean {
 export const NEAR_ARGS_EXEMPT: ReadonlySet<string> = new Set(["codemode"]);
 
 /**
- * How many times one signature may be acknowledged per prompt. Both ends are
- * needed: an agent needs a second ack when the first window refills, and a
- * bound so "acknowledge, retry, get blocked, acknowledge" cannot become the
- * loop it was meant to allow. Reset per prompt with the rest of the window.
+ * Acks per TOOL per prompt, not per signature: the loop this bounds drifts its
+ * args on every retry, which refills a per-signature budget.
  */
 export const ACK_LIMIT = 2;
 
@@ -214,7 +223,8 @@ export class LoopDetector {
   readonly opts: LoopOptions;
   private recentSigs: { sig: string; tool: string; args: string; ts: number }[] = [];
   private recentResults: { tool: string; error: boolean; ts: number }[] = [];
-  private blockedBySig = new Map<string, number>();
+  /** Last blocked signature; escalation means "it was just blocked and is still in the window". */
+  private lastBlockedSig: string | null = null;
   private recentTexts: { text: string; ts: number }[] = [];
   private lastText: string | null = null;
   private textStreak = 0;
@@ -224,7 +234,7 @@ export class LoopDetector {
   /** Per-parent (per-script) call windows, keyed by the parent tool-call id. */
   private nestedSigs = new Map<string, { sig: string; tool: string; args: string }[]>();
   /** Nested call ids in flight, for wiring results back to their signature. */
-  private nestedIds = new Map<string, { tool: string; args: string }>();
+  private nestedIds = new Map<string, { tool: string; args: string; parent: string }>();
   /** Blocks per nested signature, prompt-scoped: a NEW script re-issuing a blocked signature escalates. */
   private nestedBlockedBySig = new Map<string, number>();
   /** Signatures whose identical nested call already errored inside that script. */
@@ -233,22 +243,13 @@ export class LoopDetector {
 
   /** The most recent block, so `loop_ack` acts on it without re-sending arguments. */
   private lastBlock: LastBlock | null = null;
-  /**
-   * Acks per signature. Must outlive a block: acknowledging clears the window, so
-   * the same call blocks again on its next repeat and the count has to carry over
-   * for the limit to bound anything.
-   */
-  private acksBySig = new Map<string, number>();
+  private acksByTool = new Map<string, number>();
 
   constructor(opts: LoopOptions = DEFAULT_OPTIONS) {
     this.opts = opts;
   }
 
-  /**
-   * Let the last blocked call through: drop its window entries so the repetition
-   * count restarts, and allow the next call. Returns the tool it cleared, or why
-   * it cannot be overridden.
-   */
+  /** Let the last blocked call through, or say why it must not be. */
   acknowledge(): Result<string, string> {
     const block = this.lastBlock;
     if (block === null) {
@@ -261,15 +262,18 @@ export class LoopDetector {
         `the last block reports failures, not just a repeat, so repeating the call will not help — fix the failure or ask the user.`,
       );
     }
-    const acks = this.acksBySig.get(block.sig) ?? 0;
+    const acks = this.acksByTool.get(block.toolName) ?? 0;
     if (acks >= ACK_LIMIT) {
       return Result.err(
-        `already acknowledged ${acks} times; acknowledging again would create the loop it was meant to allow. Change the approach.`,
+        `already acknowledged ${acks} times for "${block.toolName}" this prompt; acknowledging again would create the loop it was meant to allow. Change the approach.`,
       );
     }
-    this.acksBySig.set(block.sig, acks + 1);
-    this.recentSigs = this.recentSigs.filter((s) => s.sig !== block.sig);
-    this.blockedBySig.delete(block.sig);
+    this.acksByTool.set(block.toolName, acks + 1);
+    // Drop the tool's entries, not just the blocked signature: a near-identical
+    // block leaves its cluster behind and would re-block the acknowledged retry.
+    this.recentSigs = this.recentSigs.filter((s) => s.tool !== block.toolName);
+    this.lastBlockedSig = null;
+    this.lastBlock = null;
     return Result.ok(block.toolName);
   }
 
@@ -288,14 +292,14 @@ export class LoopDetector {
     // caller decides whether a repeat was waste).
     if (repeats >= 1) this.repeatArgTokens += estimateTokens(stringify(input));
 
+    const consecutiveFails = this.consecutiveFails(toolName);
     const reasons = collectBlockReasons(
       toolName,
       total,
-      this.consecutiveFails(toolName),
+      consecutiveFails,
       this.failRate(toolName),
       this.opts,
     );
-
     // Exact-signature miss: a loop that varies cosmetic fields (the `i` intent
     // label, tail flags, timeouts) never repeats a signature. Production data:
     // 7 of 9 commands repeated ≥3× in a live session had fully distinct args
@@ -312,22 +316,30 @@ export class LoopDetector {
 
   /** Record the block, and return the decision the model sees. */
   private block(toolName: string, sig: string, reasons: string[]): BlockDecision {
-    const blockedCount = (this.blockedBySig.get(sig) ?? 0) + 1;
-    this.blockedBySig.set(sig, blockedCount);
+    // Only a signature this window still holds can escalate: keeping a count
+    // past eviction made a later, unrelated loop abort on its first block.
+    const escalate = this.lastBlockedSig === sig;
+    this.lastBlockedSig = sig;
     // Only a pure repeat may be overridden, and only while the tool is not
     // failing: a repeat of something broken is a blind retry, and the repeat
     // rule fires before the failure streak reaches its own threshold. Deciding
     // here means `loop_ack` never has to re-derive it.
     const overridable = this.consecutiveFails(toolName) === 0 && !hasFailureReason(reasons);
     this.lastBlock = { sig, toolName, overridable };
+    // Consume the evidence: a blocked call never runs, so nothing else can clear it.
+    if (hasFailureReason(reasons)) {
+      while (this.recentResults.at(-1)?.error && this.recentResults.at(-1)?.tool === toolName) {
+        this.recentResults.pop();
+      }
+    }
     const cost =
-      this.repeatArgTokens > 0 ? ` ~${this.repeatArgTokens} tokens of repeated arguments.` : "";
+      this.repeatArgTokens > 0 ? ` ~${this.repeatArgTokens} tokens of repeated arguments` : "";
     const escape = overridable
       ? " If this repeat is intentional (waiting on an external change, polling a job), call loop_ack and say why."
       : "";
     return {
       reason: `${reasons.join("; ")}${cost}. BLOCKED by anti-doom-loop — you appear to be looping. Change your approach, use a different tool, or ask the user.${escape}`,
-      escalate: blockedCount > 1,
+      escalate,
     };
   }
 
@@ -372,7 +384,11 @@ export class LoopDetector {
 
     const blockedCount = (this.nestedBlockedBySig.get(sig) ?? 0) + 1;
     this.nestedBlockedBySig.set(sig, blockedCount);
+    // A nested block supersedes any pending top-level one: nothing is ackable.
+    this.lastBlock = null;
     return Result.ok({
+      // Same one-field escalation as the top-level path: a signature blocked in
+      // an earlier script escalates here.
       reason:
         reasons.join("; ") +
         `. BLOCKED by anti-doom-loop — inside a script, store the first result in a variable and reuse it instead of calling again.`,
@@ -393,10 +409,11 @@ export class LoopDetector {
     if (!pool) {
       pool = [];
       this.nestedSigs.set(parentToolCallId, pool);
+      this.evictNestedParents();
     }
     pool.push({ sig: `${toolName}:${args}`, tool: toolName, args });
     if (pool.length > NESTED_POOL_LIMIT) pool.splice(0, pool.length - NESTED_POOL_LIMIT);
-    this.nestedIds.set(toolCallId, { tool: toolName, args });
+    this.nestedIds.set(toolCallId, { tool: toolName, args, parent: parentToolCallId });
     this.nestedCallCount++;
   }
 
@@ -414,6 +431,23 @@ export class LoopDetector {
     if (errs.size > NESTED_POOL_LIMIT) {
       const oldest = errs.values().next();
       if (!oldest.done) errs.delete(oldest.value);
+    }
+  }
+
+  /** A finished script's window (and its in-flight ids) is dead weight. */
+  finishNested(parentToolCallId: string): void {
+    if (!this.nestedSigs.delete(parentToolCallId)) return;
+    this.nestedErrorSigs.delete(parentToolCallId);
+    for (const [id, entry] of this.nestedIds) {
+      if (entry.parent === parentToolCallId) this.nestedIds.delete(id);
+    }
+  }
+
+  /** Keep at most NESTED_PARENT_LIMIT live script windows; drop the oldest. */
+  private evictNestedParents(): void {
+    for (const parent of this.nestedSigs.keys()) {
+      if (this.nestedSigs.size <= NESTED_PARENT_LIMIT) return;
+      this.finishNested(parent);
     }
   }
 
@@ -594,6 +628,9 @@ export class LoopDetector {
       this.recentSigs = this.recentSigs.filter((s) => s.ts >= cutoff);
     }
     while (this.recentSigs.length > this.opts.windowSize) this.recentSigs.shift();
+    // Escalation only means "ignored a moment ago": once the blocked signature
+    // left the window, a later loop of it is a new block, not a retry.
+    if (!this.recentSigs.some((s) => s.sig === this.lastBlockedSig)) this.lastBlockedSig = null;
   }
 
   private evictResults(): void {
@@ -647,7 +684,7 @@ export class LoopDetector {
   reset(): void {
     this.recentSigs = [];
     this.recentResults = [];
-    this.blockedBySig.clear();
+    this.lastBlockedSig = null;
     this.recentTexts = [];
     this.lastText = null;
     this.textStreak = 0;
@@ -658,13 +695,7 @@ export class LoopDetector {
     this.nestedErrorSigs.clear();
     this.nestedCallCount = 0;
     this.lastBlock = null;
-    this.acksBySig.clear();
-  }
-
-  summary(): string {
-    const blocked = [...this.blockedBySig.values()].reduce((a, b) => a + b, 0);
-    const text = this.textStreak > 1 ? `, text streak ${this.textStreak}` : "";
-    return `window: ${this.recentSigs.length}/${this.opts.windowSize} calls, ${this.recentResults.length} results, blocked ${blocked} time(s)${text}`;
+    this.acksByTool.clear();
   }
 }
 
@@ -740,16 +771,14 @@ export interface NestedStats {
  */
 export const NESTED_REPEAT_THRESHOLD = 2;
 
-/** Max chars of one nested call's canonical args kept for identity/similarity. */
-export const NESTED_ARG_STORAGE_LIMIT = 100_000;
+/** Max chars of one nested call's args kept: identity only needs the head. */
+export const NESTED_ARG_STORAGE_LIMIT = 4_096;
 
-/**
- * Max recent calls a codemode script's window keeps. Entries hold up to
- * `NESTED_ARG_STORAGE_LIMIT` chars each, so an unbounded per-script window
- * would let one script pin hundreds of MB; in-script loops repeat adjacent
- * calls, which a recent window still catches.
- */
+/** Max recent calls per script window; 8 windows x 100 x 4 KB bounds memory. */
 export const NESTED_POOL_LIMIT = 100;
+
+/** Max live codemode script windows per prompt (a finished one is dropped). */
+export const NESTED_PARENT_LIMIT = 8;
 // ponytail: 0.55 misses ONE shape — short (~11-token) commands that change
 // BOTH ends at once (added wrapper + changed tail glue → ~0.53); single-axis
 // drift and longer commands clear. Upgrade path if that shape shows up:

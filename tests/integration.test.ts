@@ -194,6 +194,35 @@ describe("controller: steer → abort → bounded resume", () => {
   });
 });
 
+describe("controller: the prompt reset keeps the session budget (ISS-2)", () => {
+  it("a second prompt's loop still gets no resume once the budget is spent", () => {
+    const rig = makeFakePi();
+    indexDefault(rig.pi);
+    const ctx = fakeCtx();
+    const loop = "Let me fetch the merge ref:";
+    const fireMsg = () =>
+      rig.fire(
+        "message_end",
+        { message: { role: "assistant", content: [{ type: "text", text: loop }] } },
+        ctx,
+      );
+    const resumes = () => rig.sent.filter((s) => s.options?.deliverAs === "followUp").length;
+
+    fireMsg();
+    fireMsg();
+    fireMsg(); // steer
+    fireMsg(); // abort + the one resume
+    assert.equal(resumes(), 1);
+
+    rig.fire("message_end", { message: { role: "user", content: [] } }, ctx);
+    fireMsg();
+    fireMsg();
+    fireMsg(); // steer again — per prompt, that is correct
+    fireMsg(); // abort, but the session budget is spent
+    assert.equal(resumes(), 1, "a new prompt must not restore the session resume budget");
+  });
+});
+
 describe("controller: counters + suspend", () => {
   it("status reports steers and aborts for the session", () => {
     const c = createController();
@@ -390,6 +419,77 @@ describe("index.ts adapter (fake PiLike)", () => {
 
     await cmd!.handler("reset", ctx);
     assert.match(notices[3], /counters reset/);
+  });
+});
+
+describe("machine invariants the bugs broke", () => {
+  it("a nested block clears the pending top-level block (ISS-4)", () => {
+    const c = createController();
+    const CMD = { command: "npm test" };
+    c.onToolCall("bash", CMD, "a");
+    c.onToolResult("bash", "a", false);
+    c.onToolCall("bash", CMD, "b");
+    c.onToolResult("bash", "b", false);
+    assert.ok(c.onToolCall("bash", CMD, "c") !== null, "top-level block pending");
+    // A script blocks internally — the current block is the nested one.
+    c.onToolCall("read", { path: "x" }, "p/1", "p");
+    c.onToolCall("read", { path: "x" }, "p/2", "p");
+    assert.equal(c.acknowledge().acked, false, "no stale top-level block to acknowledge");
+  });
+
+  it("a suspended call/result pair never biases the re-enabled window (ISS-3)", () => {
+    const c = createController();
+    c.suspend();
+    for (let i = 0; i < 3; i++) {
+      c.onToolCall("bash", { command: `poll ${i}` }, `c${i}`);
+      c.onToolResult("bash", `c${i}`, true);
+    }
+    c.resume();
+    assert.equal(
+      c.onToolCall("bash", { command: "fresh" }, "n1"),
+      null,
+      "a fresh call after resume must not be blocked by off-period failures",
+    );
+  });
+
+  it("a text steer does not starve the nested-codemode steer (ISS-5)", () => {
+    const c = createController();
+    const loop = "Let me fetch the merge ref:";
+    c.onMessageEnd("assistant", [{ type: "text", text: loop }]);
+    c.onMessageEnd("assistant", [{ type: "text", text: loop }]);
+    assert.equal(
+      c.onMessageEnd("assistant", [{ type: "text", text: loop }])?.action,
+      "steer",
+      "the text ladder steers first",
+    );
+    c.onToolCall("read", { path: "a.ts" }, "p/1", "p");
+    c.onToolCall("read", { path: "a.ts" }, "p/2", "p"); // nested block
+    const nested = c.onMessageEnd("assistant", [{ type: "text", text: "All reads done." }]);
+    assert.ok(nested !== null && nested.nested === true, "the swallowed nested block still steers");
+  });
+
+  it("the duplicate-batch abort is counted (ISS-9)", () => {
+    const c = createController();
+    const spam = Array.from({ length: 3 }, () => ({
+      type: "toolCall",
+      name: "bash",
+      arguments: { command: "true" },
+    }));
+    assert.equal(c.onMessageEnd("assistant", spam)?.action, "abort");
+    assert.match(c.status(), /aborts=1/);
+  });
+
+  it("a finished codemode script releases its window (ISS-6)", () => {
+    const c = createController();
+    c.onToolCall("codemode", { code: "x" }, "parent-1");
+    c.onToolCall("read", { path: "a.ts" }, "parent-1/1", "parent-1");
+    c.onToolResult("read", "parent-1/1", false, "parent-1");
+    c.onToolResult("codemode", "parent-1", false);
+    assert.equal(
+      c.onToolCall("read", { path: "a.ts" }, "parent-1/again", "parent-1"),
+      null,
+      "the finished script's history is gone",
+    );
   });
 });
 
@@ -759,6 +859,7 @@ describe("loop_ack tool through the adapter", () => {
       rig.fire("tool_call", { toolName: "bash", toolCallId: `f${i}`, input: { command: c } }, ctx);
       rig.fire("tool_result", { toolName: "bash", toolCallId: `f${i}`, isError: true }, ctx);
     }
+
     const failing = { command: "npm run typecheck" };
     const blocked = rig.fire(
       "tool_call",
