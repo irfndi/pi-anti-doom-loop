@@ -18,7 +18,7 @@ pi install npm:pi-anti-doom-loop
 | Signal                                                  | Default                       | Blocked when                                                                                                                                         |
 | ------------------------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Same `(tool, args)` repeated                            | 3× in the last 10 calls       | The pattern has repeated `3` times with no change                                                                                                    |
-| Same tool failing consecutively                         | 3×                            | A tool errored `3` times in a row — stop retrying it blindly                                                                                         |
+| Same tool failing consecutively                         | 3×                            | A tool errored `3` times in a row — stop retrying it blindly. The next call is allowed through                                                       |
 | Same assistant text verbatim                            | 3× within the last N messages | The model re-emitted identical text `3` times inside the sliding window                                                                              |
 | Same sentence inside ONE message                        | 3×                            | A sentence repeats `3`+ times within a single message (growing self-concatenation loops)                                                             |
 | Near-identical text (rephrasing)                        | 3× in a row                   | Consecutive messages share ≥55% tokens — the model is rephrasing the same step                                                                       |
@@ -34,9 +34,14 @@ The first text-loop detection **steers** the agent mid-run (injects guidance,
 lets it continue). If it persists, the run is **aborted** and **one** fresh-
 resume directive is queued so work continues with a new approach. If it still
 loops after that, the run aborts for real and control returns to you — the
-auto-resume budget is capped so a truly stuck model can't cycle forever.
-Counters reset on every user prompt, so a task legitimately repeated later in
-the same session is never a false positive.
+auto-resume budget is capped per **session** (a new prompt does not restore it)
+so a truly stuck model can't cycle forever. Detection counters reset on every
+user prompt, so a task legitimately repeated later in the same session is never
+a false positive.
+
+Every state machine behind this behaviour — states, invariants, and the
+transitions the code allows — is documented in
+[`docs/state-machines.md`](docs/state-machines.md).
 
 ## Configuration
 
@@ -47,7 +52,7 @@ Environment variables, read at session/prompt start:
 | `PI_ANTI_LOOP_REPEATS`       | `3`     | Identical-call block threshold                                                                                                                     |
 | `PI_ANTI_LOOP_FAILS`         | `3`     | Consecutive-failure block threshold                                                                                                                |
 | `PI_ANTI_LOOP_TEXT_REPEATS`  | `3`     | Window/cycle repeat threshold for identical and near-identical assistant texts                                                                     |
-| `PI_ANTI_LOOP_WINDOW`        | `10`    | How many recent calls/results are inspected                                                                                                        |
+| `PI_ANTI_LOOP_WINDOW`        | `10`    | How many recent calls/results are inspected (raised if a threshold needs more)                                                                     |
 | `PI_ANTI_LOOP_TIME_WINDOW`   | `0`     | Elapsed-time window in ms (`0` = disabled, count-only): evicts window entries older than this so slow chronic loops over a long session are caught |
 | `PI_ANTI_LOOP_FAIL_RATE`     | `0`     | Fail-rate block threshold `0..1` (`0` = disabled): block when a tool's error share of its in-window calls reaches this                             |
 | `PI_ANTI_LOOP_FAIL_RATE_MIN` | `3`     | Minimum calls before the fail-rate window can block                                                                                                |
@@ -67,7 +72,9 @@ tool registered by this extension:
 1. A repeat block names it, in the block reason: _"If this repeat is
    intentional … call loop_ack and say why."_
 2. The agent calls `loop_ack` with the reason.
-3. The call it just got blocked on is cleared from the window, and the retry
+3. The call it just got blocked on is cleared from the window — and so is the
+   whole near-identical cluster behind the block, so a retry whose args drifted
+   (the `head`, a `sleep` wrapper) is not instantly re-blocked — and the retry
    runs.
 
 It acts on the **last block**, so the agent never re-sends the arguments — the
@@ -82,8 +89,11 @@ It is deliberately narrow:
   success, the block is a blind retry, and the hint is not offered at all.
   An acknowledgement never erases failure evidence, so a command that starts
   failing re-blocks.
-- **Bounded.** One call can be acknowledged twice, not more — otherwise
-  "ack, retry, blocked, ack" becomes the loop it was meant to allow.
+- **Bounded per tool.** One tool can be acknowledged twice per prompt, not
+  more — otherwise "ack, retry, blocked, ack" becomes the loop it was meant to
+  allow. Scoped to the tool rather than the exact call, because a drifting loop
+  changes its arguments on every retry and would otherwise get a fresh
+  allowance each time.
 - **Reset with everything else** on the next user prompt.
 
 Prefer this over the disable switches when only one call is in question.

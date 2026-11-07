@@ -100,7 +100,7 @@ export interface AntiLoopController {
   onMessageEnd(role: string, content: MessageContent): TextLoopOutcome | null;
   /** Let the last blocked call through because the agent states why. */
   acknowledge(): AcknowledgeOutcome;
-  /** Full reset (session start, user prompt, /loopcheck reset). */
+  /** Full reset (user prompt, /loopcheck reset): per-prompt state only. */
   reset(): void;
   /** Suspend detection until the next reset (escape hatch for intentional repetition). */
   suspend(): void;
@@ -114,11 +114,10 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
   let detector = new LoopDetector(opts);
   const blockedIds = new Set<string>();
   let steered = false;
-  /** Nested (codemode) blocks seen but not yet surfaced to the model: scripts
-   * receive the block reason as a tool error, but only the script's return
-   * value reaches the model — the next message_end steers once so the loop
-   * signal is never swallowed by a script that ignores tool errors. */
+  /** A codemode block the model has not been told about yet: the script only
+   * sees it as a tool error, so the next assistant message steers once. */
   let steerAgain = false;
+  /** Session-scoped: `reset()` (a new prompt) must not restore these. */
   let resumes = 0;
   let steers = 0;
   let aborts = 0;
@@ -158,16 +157,16 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
     },
 
     onToolResult(toolName, toolCallId, isError, parentToolCallId) {
-      // Blocked calls never ran, so their (error) result must not count as a
-      // consecutive failure.
-      if (blockedIds.has(toolCallId)) {
-        blockedIds.delete(toolCallId);
-        return;
-      }
+      // A blocked call never ran; drop its synthesized error. A suspended
+      // call/result pair is dropped together, or half of it biases the window.
+      const wasBlocked = blockedIds.delete(toolCallId);
+      if (wasBlocked || suspended) return;
       if (parentToolCallId !== undefined) {
         detector.recordNestedResult(parentToolCallId, toolCallId, isError);
         return;
       }
+      detector.finishNested(toolCallId); // a finished script's window is dead
+
       detector.recordResult(toolName, isError);
     },
 
@@ -183,13 +182,15 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
         .filter((c) => c.type === "toolCall")
         .map((c) => ({ toolName: c.name ?? "", input: c.arguments as ToolInput }));
       const batch = detector.checkDuplicateCalls(calls);
-      if (batch.isOk()) return { reason: batch.value.reason, action: "abort", resume: false };
+      if (batch.isOk()) {
+        aborts++;
+        return { reason: batch.value.reason, action: "abort", resume: false };
+      }
 
-      // A nested codemode block may have been swallowed by the script (only
-      // its return value reaches the model): deliver the loop signal once.
-      if (steerAgain && !steered) {
+      // Deliver a swallowed nested block once. Independent of the text ladder's
+      // one-shot: a text steer says nothing about a script.
+      if (steerAgain) {
         steerAgain = false;
-        steered = true;
         steers++;
         return {
           reason: "a codemode script was blocked for repeating tool calls inside itself",
@@ -225,9 +226,8 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       steered = false;
       suspended = false;
       steerAgain = false;
-      // resumes/steers/aborts are intentionally NOT reset here: they are
-      // session-scoped so a stuck model cannot cycle steer→abort forever and
-      // /loopcheck can report lifetime counters.
+      // Session-scoped on purpose: a new prompt must not restore the resume
+      // budget, so the adapter replaces the controller only on session_start.
     },
 
     acknowledge() {

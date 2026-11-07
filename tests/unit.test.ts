@@ -15,6 +15,7 @@ import {
   tokenSimilarity,
   readOptions,
   NEAR_ARGS_SIMILARITY_THRESHOLD,
+  NESTED_PARENT_LIMIT,
   NESTED_POOL_LIMIT,
   DEFAULT_OPTIONS,
   type LoopOptions,
@@ -204,6 +205,31 @@ describe("near-identical argument detection", () => {
     );
     const diff = argSimilarity("alpha beta gamma delta epsilon", "zeta eta theta iota kappa");
     assert.ok(diff !== null && diff < NEAR_ARGS_SIMILARITY_THRESHOLD, "disjoint tokens score 0");
+  });
+});
+
+describe("failure state releases after a block (ISS-1)", () => {
+  const threeFailures = (d: LoopDetector) => {
+    for (let i = 0; i < 3; i++) {
+      d.record("bash", { command: `attempt ${i}` });
+      d.recordResult("bash", true);
+    }
+  };
+
+  it("lets a different command run once the failure block has been served", () => {
+    const d = new LoopDetector(opts);
+    threeFailures(d);
+    assert.ok(d.check("bash", { command: "echo recovered" }).isOk(), "the block itself fires");
+    assert.ok(
+      d.check("bash", { command: "echo recovered" }).isErr(),
+      "a genuinely different command must be allowed after the block",
+    );
+    // The release is not a free pass: another failThreshold errors block again.
+    for (let i = 0; i < 3; i++) {
+      d.record("bash", { command: `retry ${i}` });
+      d.recordResult("bash", true);
+    }
+    assert.ok(d.check("bash", { command: "npm test" }).isOk(), "the streak re-arms");
   });
 });
 
@@ -621,6 +647,17 @@ describe("options", () => {
       DEFAULT_OPTIONS.failRateMinCalls,
     );
   });
+
+  it("raises a too-short window so no signal is unreachable (ISS-8)", () => {
+    const o = readOptions({ PI_ANTI_LOOP_WINDOW: "2", PI_ANTI_LOOP_FAILS: "3" });
+    assert.equal(o.windowSize, 3, "the window grows to hold the failure streak");
+    const d = new LoopDetector(o);
+    for (let i = 0; i < 3; i++) d.recordResult("bash", true);
+    assert.ok(d.check("bash", { command: "npm test" }).isOk(), "the streak still blocks");
+
+    const repeats = readOptions({ PI_ANTI_LOOP_WINDOW: "2", PI_ANTI_LOOP_REPEATS: "4" });
+    assert.equal(repeats.windowSize, 3);
+  });
 });
 
 describe("helpers", () => {
@@ -785,6 +822,22 @@ describe("nested codemode calls (parentToolCallId, pi ≥ 0.99)", () => {
     // And it must not arm the error-retry rule for anything.
     assert.ok(d.checkNested("p1", "bash", { command: "npm test" }).isErr());
   });
+
+  it("live script windows are bounded by NESTED_PARENT_LIMIT (ISS-6)", () => {
+    const d = new LoopDetector(opts);
+    for (let p = 0; p < NESTED_PARENT_LIMIT + 10; p++) {
+      d.recordNested(`p${p}`, "read", `p${p}/1`, { path: "a.ts" });
+    }
+    assert.ok(
+      d.checkNested("p0", "read", { path: "a.ts" }).isErr(),
+      "the oldest window was evicted, so it is a first call again",
+    );
+    const newest = `p${NESTED_PARENT_LIMIT + 9}`;
+    assert.ok(
+      d.checkNested(newest, "read", { path: "a.ts" }).isOk(),
+      "the newest window is still live (2x rule)",
+    );
+  });
 });
 
 describe("loop_ack: the agent overriding an intentional repeat", () => {
@@ -811,12 +864,24 @@ describe("loop_ack: the agent overriding an intentional repeat", () => {
     assert.ok(d.check("bash", CMD).isErr(), "the same call is allowed after the ack");
   });
 
-  it("is bounded: two acks allowed, the third refused", () => {
+  it("clears the tool's near-identical cluster, so the drifting retry runs", () => {
+    const d = new LoopDetector(opts);
+    const head = (n: number) => gh(`cd /w && ${CMD.command} 2>&1 | head -${n}`);
+    d.check("bash", head(40));
+    d.record("bash", head(40));
+    d.check("bash", head(10));
+    d.record("bash", head(10));
+    assert.ok(d.check("bash", head(40)).isOk(), "precondition: the 3rd variant blocks");
+    assert.ok(d.acknowledge().isOk(), "acknowledging the near-identical block succeeds");
+    assert.ok(d.check("bash", head(20)).isErr(), "the retry with different args is allowed");
+  });
+
+  it("is bounded per tool: two acks allowed, the third refused even when args drift", () => {
     const d = atBlock();
     assert.ok(d.acknowledge().isOk(), "1st ack");
-    d.record("bash", CMD);
-    d.record("bash", CMD);
-    d.check("bash", CMD);
+    d.record("bash", gh("cd /w && gh run view 123 --log-failed"));
+    d.record("bash", gh("cd /w && gh run view 123 --log-failed"));
+    assert.ok(d.check("bash", gh("cd /w && gh run view 123 --log-failed")).isOk(), "re-blocked");
     assert.ok(d.acknowledge().isOk(), "2nd ack");
     d.record("bash", CMD);
     d.record("bash", CMD);
@@ -836,11 +901,7 @@ describe("loop_ack: the agent overriding an intentional repeat", () => {
     const d = new LoopDetector(opts);
     // Three different commands failing: the repeat signal never fires, the
     // failure streak does. That must not be acknowledgeable.
-    for (const c of ["npm test", "npm run lint", "npm run build"]) {
-      d.recordResult("bash", true);
-      d.check("bash", gh(c));
-    }
-    d.recordResult("bash", true);
+    for (let i = 0; i < 3; i++) d.recordResult("bash", true);
     const hit = d.check("bash", gh("npm run typecheck"));
     assert.ok(hit.isOk(), "the failure streak blocks");
     if (hit.isOk()) assert.doesNotMatch(hit.value.reason, /call loop_ack/, "no escape advertised");

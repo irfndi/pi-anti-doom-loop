@@ -160,6 +160,37 @@ describe("e2e: issue #8 — exploratory codemode scripts are not a doom loop", (
   });
 });
 
+describe("e2e: a tool blocked for repeated failures can be recovered (ISS-1)", () => {
+  it("blocks the first attempt once, then lets the fix run", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const fail = (n: number) => ({ toolCalls: [{ name: "bash", args: { command: `exit ${n}` } }] });
+    const { events } = await runPi(piRoot, {
+      turns: [
+        fail(1),
+        fail(2),
+        fail(3),
+        // The attempt after the streak is blocked, then the fix must run. Before
+        // the fix this call and every later one stayed blocked for the prompt.
+        { toolCalls: [{ name: "bash", args: { command: "echo first-attempt" } }] },
+        { toolCalls: [{ name: "bash", args: { command: "echo recovered" } }] },
+        { text: "done" },
+      ],
+      env: { PI_ANTI_LOOP_FAILS: "3" },
+    });
+    const results = toolResultEnds(events).map(resultText);
+    const blocked = results.filter((r) => r.includes("BLOCKED by anti-doom-loop"));
+    assert.equal(blocked.length, 1, `exactly one warning block, got: ${JSON.stringify(results)}`);
+    assert.ok(
+      blocked[0].includes("failed 3 consecutive times"),
+      `the block must name the failure streak, got: ${blocked[0]}`,
+    );
+    assert.ok(
+      results.some((r) => r.includes("recovered")),
+      `the fix must run, got: ${JSON.stringify(results)}`,
+    );
+  });
+});
+
 describe("e2e: global and project disable", () => {
   // Three identical bash calls: the classic top-level repeat the guard exists for.
   const loop: FakeTurn = { toolCalls: [{ name: "bash", args: { command: "echo loop-probe" } }] };
@@ -273,6 +304,12 @@ describe("e2e: loop_ack lets the agent override an intentional repeat", () => {
     const acked = results.find((r) => r.includes("Acknowledged ("));
     assert.ok(acked, `loop_ack must acknowledge, got: ${JSON.stringify(results)}`);
     assert.match(acked, /cleared from the loop window/);
+    // The retry really ran: one block, none after the ack.
+    assert.equal(
+      blocked.length,
+      1,
+      `the acknowledged retry must run, got blocks: ${JSON.stringify(blocked)}`,
+    );
   });
 
   it("refuses a failure block, which is not an intentional repeat", async (t) => {
