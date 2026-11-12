@@ -221,7 +221,7 @@ function collectBlockReasons(
  */
 export class LoopDetector {
   readonly opts: LoopOptions;
-  private recentSigs: { sig: string; tool: string; args: string; ts: number }[] = [];
+  private recentSigs: { sig: string; tool: string; text: string; ts: number }[] = [];
   private recentResults: { tool: string; error: boolean; ts: number }[] = [];
   /** Last blocked signature; escalation means "it was just blocked and is still in the window". */
   private lastBlockedSig: string | null = null;
@@ -232,7 +232,7 @@ export class LoopDetector {
 
   // --- nested codemode calls (pi ≥ 0.99: `parentToolCallId` set) ---
   /** Per-parent (per-script) call windows, keyed by the parent tool-call id. */
-  private nestedSigs = new Map<string, { sig: string; tool: string; args: string }[]>();
+  private nestedSigs = new Map<string, { sig: string; tool: string; text: string }[]>();
   /** Nested call ids in flight, for wiring results back to their signature. */
   private nestedIds = new Map<string, { tool: string; args: string; parent: string }>();
   /** Blocks per nested signature, prompt-scoped: a NEW script re-issuing a blocked signature escalates. */
@@ -300,13 +300,13 @@ export class LoopDetector {
       this.failRate(toolName),
       this.opts,
     );
-    // Exact-signature miss: a loop that varies cosmetic fields (the `i` intent
-    // label, tail flags, timeouts) never repeats a signature. Production data:
-    // 7 of 9 commands repeated ≥3× in a live session had fully distinct args
-    // with an identical `command`. Same tool + ≥55% shared arg tokens still
-    // counts as a repeat. Whole-program args are exempt (NEAR_ARGS_EXEMPT).
+    // Exact-signature miss: a loop that varies the wrapper (a `sleep 150;`
+    // prefix, an extra `| tail`, a widened `--limit`) never repeats a
+    // signature. Production data: 7 of 9 commands repeated ≥3× in a live
+    // session had fully distinct args around an identical `command`. Whole-
+    // program args are exempt (NEAR_ARGS_EXEMPT).
     if (reasons.length === 0) {
-      const nearReason = this.nearRepeatReason(toolName, args, input);
+      const nearReason = this.nearRepeatReason(toolName, input);
       if (nearReason !== null) reasons.push(nearReason);
     }
 
@@ -346,7 +346,12 @@ export class LoopDetector {
   record(toolName: string, input: ToolInput): void {
     if (this.opts.toolExclude.has(toolName)) return;
     const args = canonical(input);
-    this.recentSigs.push({ sig: `${toolName}:${args}`, tool: toolName, args, ts: Date.now() });
+    this.recentSigs.push({
+      sig: `${toolName}:${args}`,
+      tool: toolName,
+      text: nearArgsText(toolName, input),
+      ts: Date.now(),
+    });
     this.evictSigs();
   }
 
@@ -378,7 +383,13 @@ export class LoopDetector {
       toolName,
       repeats,
       this.nestedErrorSigs.get(parentToolCallId)?.has(sig) === true,
-      () => this.nearRepeats(toolName, args, pool),
+      () =>
+        this.nearRepeats(
+          toolName,
+          nearArgsText(toolName, input),
+          NESTED_REPEAT_THRESHOLD - 1,
+          pool,
+        ),
     );
     if (reasons.length === 0) return Result.err(undefined);
 
@@ -411,7 +422,7 @@ export class LoopDetector {
       this.nestedSigs.set(parentToolCallId, pool);
       this.evictNestedParents();
     }
-    pool.push({ sig: `${toolName}:${args}`, tool: toolName, args });
+    pool.push({ sig: `${toolName}:${args}`, tool: toolName, text: nearArgsText(toolName, input) });
     if (pool.length > NESTED_POOL_LIMIT) pool.splice(0, pool.length - NESTED_POOL_LIMIT);
     this.nestedIds.set(toolCallId, { tool: toolName, args, parent: parentToolCallId });
     this.nestedCallCount++;
@@ -459,28 +470,42 @@ export class LoopDetector {
     };
   }
 
-  /** Windowed same-tool entries whose args are ≥55% shared tokens (identical counts). */
+  /**
+   * Same-tool window entries connected to this call by wrapper drift, capped at
+   * `need`. Connected, not pairwise: `poll`, `timeout 30; poll` and
+   * `sleep 150; poll` are three occurrences of one call, even though the two
+   * wrappers differ from each other (each is only a wrapper of the original).
+   */
   private nearRepeats(
     toolName: string,
-    args: string,
-    pool: readonly { tool: string; args: string }[] = this.recentSigs,
+    text: string,
+    need: number,
+    pool: readonly { tool: string; text: string }[] = this.recentSigs,
   ): number {
+    const candidates = pool.filter((s) => s.tool === toolName).map((s) => argTokens(s.text));
+    const matched = new Set<number>();
+    const frontier = [argTokens(text)];
     let n = 0;
-    for (const s of pool) {
-      if (s.tool !== toolName) continue;
-      const sim = argSimilarity(args, s.args);
-      if (sim !== null && sim >= NEAR_ARGS_SIMILARITY_THRESHOLD) n++;
+    while (n < need && frontier.length > 0) {
+      const current = frontier.pop() ?? new Set<string>();
+      for (const [i, other] of candidates.entries()) {
+        if (matched.has(i) || !isWrapperDrift(current, other)) continue;
+        matched.add(i);
+        frontier.push(other);
+        n++;
+      }
     }
     return n;
   }
 
-  /** The near-identical block reason, or null. Counts this call's arg tokens as repeated. */
-  private nearRepeatReason(toolName: string, args: string, input: ToolInput): string | null {
+  /** The wrapper-drift block reason, or null. Counts this call's args as repeated. */
+  private nearRepeatReason(toolName: string, input: ToolInput): string | null {
     if (NEAR_ARGS_EXEMPT.has(toolName)) return null;
-    const near = this.nearRepeats(toolName, args);
+    const need = this.opts.repeatThreshold - 1;
+    const near = this.nearRepeats(toolName, nearArgsText(toolName, input), need);
     if (near >= 1) this.repeatArgTokens += estimateTokens(stringify(input));
-    if (near + 1 < this.opts.repeatThreshold) return null;
-    return `"${toolName}" was called with near-identical arguments ${near + 1} times in the last ${this.opts.windowSize} tool calls (only minor changes)`;
+    if (near < need) return null;
+    return `"${toolName}" was called with near-identical arguments ${near + 1} times in the last ${this.opts.windowSize} tool calls (only a wrapper changed)`;
   }
 
   recordResult(toolName: string, error: boolean): void {
@@ -715,8 +740,12 @@ export const MIN_REPEAT_CHUNK = 16;
 /** Jaccard similarity threshold for "near-identical" consecutive texts. */
 export const TEXT_SIMILARITY_THRESHOLD = 0.55;
 
-/** Shared-whitespace-token threshold for near-identical tool-call arguments. */
-export const NEAR_ARGS_SIMILARITY_THRESHOLD = 0.55;
+/**
+ * Extra tokens a wrapper may add: `sleep 150; <cmd>`, `timeout 30; <cmd>`,
+ * `<cmd> | tail -3`. Beyond this the command itself changed, so it is not the
+ * same call and exact identity is the only signal.
+ */
+const NEAR_ARGS_WRAPPER_TOKENS = 3;
 
 /**
  * Minimum token union before two arg strings are comparable. Short inputs
@@ -779,27 +808,47 @@ export const NESTED_POOL_LIMIT = 100;
 
 /** Max live codemode script windows per prompt (a finished one is dropped). */
 export const NESTED_PARENT_LIMIT = 8;
-// ponytail: 0.55 misses ONE shape — short (~11-token) commands that change
-// BOTH ends at once (added wrapper + changed tail glue → ~0.53); single-axis
-// drift and longer commands clear. Upgrade path if that shape shows up:
-// tokenize on punctuation boundaries instead of whitespace.
+
+/** Case-folded whitespace tokens of an argument text. */
+function argTokens(text: string): Set<string> {
+  return new Set(text.toLowerCase().split(/\s+/).filter(Boolean));
+}
+
+/** True for a plain string value — the one ToolInput variant a command takes. */
+function isString(value: ToolInput): value is string {
+  return typeof value === "string";
+}
 
 /**
- * Case-insensitive whitespace-token Jaccard over canonical args.
- * Full tokens (no word filtering): a changed field glues into its own token,
- * so only genuinely shared structure counts — same command with a rephrased
- * `i` label scores ~0.8, two different commands score far below the threshold.
- * Returns null when the union is too small to judge.
+ * The text a wrapper-drift comparison runs on. For `bash` that is the bare
+ * `command`, because canonical JSON glues a change into a neighbouring token
+ * (a URL swap rewrites the blob's tail, a `sleep` prefix merges into
+ * `"command":"gh`), so no wrapper would read as a pure insertion.
  */
-export function argSimilarity(a: string, b: string): number | null {
-  const as = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
-  const bs = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
-  if (as.size === 0 || bs.size === 0) return null;
-  let inter = 0;
-  for (const t of as) if (bs.has(t)) inter++;
-  const union = as.size + bs.size - inter;
-  if (union < NEAR_ARGS_MIN_UNION) return null;
-  return inter / union;
+function nearArgsText(toolName: string, input: ToolInput): string {
+  if (toolName !== "bash" || !(input instanceof Object) || Array.isArray(input)) {
+    return canonical(input);
+  }
+  const command = input["command"];
+  return isString(command) ? command : canonical(input);
+}
+
+/**
+ * True when one argument text is the other plus at most
+ * `NEAR_ARGS_WRAPPER_TOKENS` tokens: the same call re-issued with a `sleep`
+ * prefix or an extra `| tail`.
+ *
+ * Drift is one-way containment, not a similarity score, because a score cannot
+ * tell a wrapped poll (a real loop) from a curl whose URL operand changed (a
+ * loop over targets — what a codemode script is for): on a 13-token command one
+ * changed operand still scores 0.85, right next to a genuinely wrapped one at
+ * 0.72.
+ */
+function isWrapperDrift(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  const [small, big] = a.size <= b.size ? [a, b] : [b, a];
+  if (big.size < NEAR_ARGS_MIN_UNION) return false;
+  for (const t of small) if (!big.has(t)) return false;
+  return big.size > small.size && big.size - small.size <= NEAR_ARGS_WRAPPER_TOKENS;
 }
 
 /** Stable string form of a tool input (used for token estimation). */

@@ -139,7 +139,8 @@ tracks them:
 - **Stricter in-script threshold** — inside one script, the 2nd identical
   call blocks (top-level detection needs 3). A repeated call inside a script
   is never progress: the script can store its first result in a variable and
-  reuse it. Near-identical args (sleep-wrapped polls, flag drift) count too.
+  reuse it. Wrapper drift (a `sleep`/`timeout` prefix, an extra `| tail`) on
+  a repeated command counts too; a loop over different targets does not.
 - **Error-retry rule** — an identical retry of a call that already errored
   inside the same script blocks immediately with a "the identical call
   already failed inside this script" reason.
@@ -158,15 +159,26 @@ tracks them:
 Huge nested payloads (whole-file reads) are identity-capped (100 KB per call)
 and each script keeps only its most recent 100 calls, so memory stays bounded. `/loopcheck` reports `nested: calls=N blocks=M`.
 
-**Scripts are exempt from the top-level near-identical rule.** Two _different_
-scripts share JS boilerplate (`const`, `await`, `tools`, `return`), so their
-shared-token score is ~0.7 — above the 0.55 near-identical bar. Sequential
+**Wrapper drift, not token overlap.** A near-identical call is the same
+`command` with at most three tokens added or removed: `gh run list …` re-issued
+as `sleep 150; gh run list …`, or with `| tail -3` appended. Entries are
+compared as a connected group, so `poll`, `timeout 30; poll` and
+`sleep 150; poll` are three occurrences of one call even though the wrappers
+differ from each other.
+
+A shared-token score cannot make this call: on a 13-token curl probe, changing
+one URL operand still scores 0.85, sitting right next to a genuinely wrapped
+poll at 0.72. Scoring flagged the second probe of a nine-URL status sweep — a
+loop over _targets_, which is what a codemode script is for. Containment asks
+the question that matters: is this the same call with cosmetic padding?
+
+**Scripts are exempt from the near-identical rule entirely.** Two _different_
+scripts share JS boilerplate (`const`, `await`, `tools`, `return`); sequential
 one-off scripts checking different hypotheses are normal exploration, not a
-loop, and the near-identical rule blocked them. They are therefore compared by
-exact identity only (the same script re-issued still blocks), while their real
-loop shape — repeated calls _inside_ one script — stays covered by the nested
-2× rule above. If a specific call is a deliberate repeat, the agent can clear it
-with `loop_ack`.
+loop. They are compared by exact identity only (the same script re-issued still
+blocks), while their real loop shape — repeated calls _inside_ one script — is
+covered by the nested 2× rule above. If a specific call is a deliberate repeat,
+the agent can clear it with `loop_ack`.
 
 ## Token-cost awareness
 

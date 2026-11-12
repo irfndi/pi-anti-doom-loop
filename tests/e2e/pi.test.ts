@@ -134,6 +134,66 @@ describe("e2e: codemode nested loop (real codemode worker)", () => {
   });
 });
 
+describe("e2e: a loop over targets is not a loop over a call", () => {
+  // The reported session: one curl probed against nine paths inside one script.
+  // Nothing was repeated, but a shared-token score read it as the same call and
+  // blocked from the second probe.
+  it("probes nine distinct paths inside one script without a block", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const paths = ["/", "/login", "/news", "/knowledge", "/event", "/api/health"];
+    const probe = (path: string) => `echo probe ${path}`;
+    const { events } = await runPi(piRoot, {
+      turns: [
+        {
+          toolCalls: [
+            {
+              name: "codemode",
+              args: {
+                code: `const paths = ${JSON.stringify(paths)};\nfor (const p of paths) { await tools.bash({ command: "echo probe " + p }); }\nreturn "swept";`,
+              },
+            },
+          ],
+        },
+        { text: "sweep done" },
+      ],
+    });
+    const results = toolResultEnds(events).filter((e) => e.message?.toolName === "codemode");
+    assert.equal(results.length, 1, "the sweep must run as one codemode call");
+    const text = resultText(results[0]);
+    assert.doesNotMatch(
+      text,
+      /BLOCKED by anti-doom-loop/,
+      `${probe(paths[0])} … are distinct targets`,
+    );
+    assert.match(text, /Script completed/, "all six probes must complete");
+  });
+
+  it("blocks one poll re-issued behind a sleep wrapper inside one script", async (t) => {
+    if (!piRoot) return t.skip("pi install unavailable (offline)");
+    const poll = "echo poll --branch main --limit 3";
+    const { events } = await runPi(piRoot, {
+      turns: [
+        {
+          toolCalls: [
+            {
+              name: "codemode",
+              args: {
+                code: `await tools.bash({ command: ${JSON.stringify(poll)} });\nawait tools.bash({ command: "sleep 1; " + ${JSON.stringify(poll)} });\nreturn "polled";`,
+              },
+            },
+          ],
+        },
+        { text: "codemode loop observed" },
+      ],
+    });
+    const results = toolResultEnds(events).filter((e) => e.message?.toolName === "codemode");
+    assert.equal(results.length, 1);
+    const text = resultText(results[0]);
+    assert.match(text, /Script failed/, "the wrapped repeat must fail the script");
+    assert.match(text, /near-identical arguments 2 times inside one codemode script/);
+  });
+});
+
 describe("e2e: issue #8 — exploratory codemode scripts are not a doom loop", () => {
   it("runs three distinct scripts in sequence without a block", async (t) => {
     if (!piRoot) return t.skip("pi install unavailable (offline)");

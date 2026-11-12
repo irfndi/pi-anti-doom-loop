@@ -7,9 +7,9 @@
  *
  *  - identical (tool, args) repeated `PI_ANTI_LOOP_REPEATS` times (default 3)
  *    in the last `PI_ANTI_LOOP_WINDOW` calls → block with an instructive reason
- *  - near-identical same-tool args (≥ 55% shared whitespace tokens, union ≥ 5)
- *    count toward the same threshold — sleep-wrapped polls, flag/pattern/tail
- *    drift that exact identity misses by construction
+ *  - near-identical same-tool args — the same command with a wrapper added or
+ *    removed (`sleep 150; <cmd>`, `<cmd> | tail -3`) — count toward the same
+ *    threshold: the drift exact identity misses by construction
  *  - the same tool failing `PI_ANTI_LOOP_FAILS` consecutive times (default 3)
  *    → block with a "stop retrying, fix the root cause" reason
  *  - the model repeating text: verbatim, near-identical (token similarity),

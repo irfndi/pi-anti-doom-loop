@@ -6,7 +6,6 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   LoopDetector,
-  argSimilarity,
   canonical,
   signature,
   normalizeText,
@@ -14,7 +13,6 @@ import {
   repeatedSegment,
   tokenSimilarity,
   readOptions,
-  NEAR_ARGS_SIMILARITY_THRESHOLD,
   NESTED_PARENT_LIMIT,
   NESTED_POOL_LIMIT,
   DEFAULT_OPTIONS,
@@ -190,21 +188,39 @@ describe("near-identical argument detection", () => {
     }
   });
 
-  it("argSimilarity: threshold, case folding, and small-union guards", () => {
-    assert.equal(
-      argSimilarity('{"command":"true"}', '{"command":"false"}'),
-      null,
-      "union < 5 is not comparable",
-    );
-    assert.equal(argSimilarity("a b", "a c"), null, "union < 5 is not comparable");
-    assert.equal(argSimilarity("", "a b c d e"), null, "empty side is not comparable");
-    const ci = argSimilarity("Polling CI status rerun now", "polling ci status rerun now");
+  it("wrapper drift: a changed operand is not drift, an added wrapper is", () => {
+    // The incident: one curl probe, nine different paths.
+    const probe = (p: string) =>
+      `rtk curl -sk -o /dev/null -m 20 -w '%{http_code}' --resolve dev.aplg-learning.com:443:43.128.218.65 "https://dev.aplg-learning.com${p}"`;
+    const target = new LoopDetector(opts);
+    for (const p of ["/", "/login", "/news", "/api/health"]) {
+      const hit = target.check("bash", { command: probe(p) });
+      assert.ok(hit.isErr(), `${p} is a different target, not drift`);
+      target.record("bash", { command: probe(p) });
+    }
+    // The loop this signal exists for: the same poll, wrapped or tailed.
+    const d = new LoopDetector(opts);
+    const poll = "gh run list --branch main --limit 3 2>&1 | head -6";
+    for (const variant of [poll, `sleep 150; ${poll}`]) {
+      assert.ok(d.check("bash", { command: variant }).isErr(), `${variant} is only the 2nd`);
+      d.record("bash", { command: variant });
+    }
+    const hit = d.check("bash", { command: `timeout 30; ${poll}` });
+    assert.ok(hit.isOk(), "the 3rd wrapper of one poll must block");
+    if (hit.isOk()) assert.match(hit.value.reason, /only a wrapper changed/);
+  });
+
+  it("two different wrappers of one command are one loop, not two", () => {
+    const d = new LoopDetector(opts);
+    const poll = "gh run list --branch main --limit 3";
+    d.record("bash", { command: `sleep 150; ${poll}` });
+    d.record("bash", { command: `timeout 30; ${poll}` });
+    // The wrappers differ from each other, so only the unwrapped command is a
+    // wrapper of both — chaining is what makes these three one call.
     assert.ok(
-      ci !== null && ci >= NEAR_ARGS_SIMILARITY_THRESHOLD,
-      "case-insensitive equality scores 1",
+      d.check("bash", { command: poll }).isOk(),
+      "the unwrapped command is drift of both wrappers",
     );
-    const diff = argSimilarity("alpha beta gamma delta epsilon", "zeta eta theta iota kappa");
-    assert.ok(diff !== null && diff < NEAR_ARGS_SIMILARITY_THRESHOLD, "disjoint tokens score 0");
   });
 });
 
@@ -317,18 +333,10 @@ describe("tool exclusion", () => {
 
 describe("codemode scripts are not near-identical to each other (issue #8)", () => {
   // The incident: three DIFFERENT one-off scripts bisecting a CSS bug, each a
-  // separate codemode call. They share JS boilerplate, so the token-overlap
-  // rule scored them ~0.69 — above the 0.55 near-identical bar — and the third
-  // call was blocked even though every script checked a different hypothesis.
+  // separate codemode call. Each checks a different hypothesis, so none is the
+  // other plus a wrapper — and the tool is exempt from the rule regardless.
   const script = (stage: string, file: string) => ({
     code: `const r = await tools.bash({ command: "node scripts/bisect.mjs --stage=${stage} --css=${file}" });\ntext(r.output);`,
-  });
-
-  it("near-identical scoring WOULD have fired — so the exemption is what protects the call", () => {
-    const a = canonical(script("a", "tailwind.css"));
-    const b = canonical(script("b", "app.css"));
-    const sim = argSimilarity(b, a);
-    assert.ok(sim !== null && sim >= NEAR_ARGS_SIMILARITY_THRESHOLD, `scores ${sim} (>= 0.55)`);
   });
 
   it("three distinct scripts in sequence are never blocked", () => {
@@ -866,14 +874,17 @@ describe("loop_ack: the agent overriding an intentional repeat", () => {
 
   it("clears the tool's near-identical cluster, so the drifting retry runs", () => {
     const d = new LoopDetector(opts);
-    const head = (n: number) => gh(`cd /w && ${CMD.command} 2>&1 | head -${n}`);
-    d.check("bash", head(40));
-    d.record("bash", head(40));
-    d.check("bash", head(10));
-    d.record("bash", head(10));
-    assert.ok(d.check("bash", head(40)).isOk(), "precondition: the 3rd variant blocks");
+    const wrapped = (prefix: string) => gh(`${prefix}${CMD.command}`);
+    d.check("bash", CMD);
+    d.record("bash", CMD);
+    d.check("bash", wrapped("sleep 5; "));
+    d.record("bash", wrapped("sleep 5; "));
+    assert.ok(
+      d.check("bash", wrapped("timeout 30; ")).isOk(),
+      "precondition: the 3rd variant blocks",
+    );
     assert.ok(d.acknowledge().isOk(), "acknowledging the near-identical block succeeds");
-    assert.ok(d.check("bash", head(20)).isErr(), "the retry with different args is allowed");
+    assert.ok(d.check("bash", wrapped("sleep 90; ")).isErr(), "the retry is allowed");
   });
 
   it("is bounded per tool: two acks allowed, the third refused even when args drift", () => {

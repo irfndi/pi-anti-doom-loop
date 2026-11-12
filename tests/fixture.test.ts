@@ -19,6 +19,10 @@ import {
   codemodeErrorRetryLoop,
   codemodeCrossScriptRepeat,
   codemodeHealthyBatch,
+  codemodeMultiTargetProbe,
+  codemodeWrapperPollLoop,
+  topLevelMultiTargetProbe,
+  topLevelWrapperPollLoop,
   type NestedFixture,
 } from "./fixtures.ts";
 
@@ -199,5 +203,39 @@ describe("fixtures: codemode nested loops (controller path)", () => {
     assert.equal(topLevelBlocks, 0, "2 identical top-level calls must not block (3× rule)");
     const { blocked } = runNested(codemodeErrorRetryLoop);
     assert.ok(blocked >= 1, "the same 2 calls inside one script must block (2× rule)");
+  });
+});
+
+describe("fixtures: wrapper drift vs a loop over targets (the incident)", () => {
+  // The reported session probed nine paths with one curl inside ONE script.
+  // Nothing repeated, yet a shared-token score read it as the same call.
+  it(`never blocks: ${codemodeMultiTargetProbe.name}`, () => {
+    const { blocked } = runNested(codemodeMultiTargetProbe);
+    assert.equal(blocked, 0, "nine different targets are nine calls, not one repeated call");
+  });
+
+  it(`never blocks: ${topLevelMultiTargetProbe.name}`, () => {
+    const c = createController();
+    let blocked = 0;
+    topLevelMultiTargetProbe.calls.forEach((call, i) => {
+      if (c.onToolCall(call.tool, call.args, `probe-${i}`) !== null) blocked++;
+      c.onToolResult(call.tool, `probe-${i}`, false);
+    });
+    assert.equal(blocked, 0, "the same sweep at top level must not block either");
+  });
+
+  it(`blocks in-script: ${codemodeWrapperPollLoop.name}`, () => {
+    const { blocked } = runNested(codemodeWrapperPollLoop);
+    assert.equal(blocked, 1, "one poll re-issued behind a wrapper is an in-script repeat");
+  });
+
+  it(`blocks: ${topLevelWrapperPollLoop.name}`, () => {
+    const c = createController();
+    let blocked = 0;
+    topLevelWrapperPollLoop.calls.forEach((call, i) => {
+      if (c.onToolCall(call.tool, call.args, `poll-${i}`) !== null) blocked++;
+      c.onToolResult(call.tool, `poll-${i}`, false);
+    });
+    assert.equal(blocked, 1, "the 3rd wrapper of one poll must block");
   });
 });

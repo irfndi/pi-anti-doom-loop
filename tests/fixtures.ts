@@ -202,3 +202,69 @@ export const codemodeHealthyBatch: NestedFixture = {
     { parent: "cm1", id: "cm1/3", tool: "grep", args: { pattern: "TODO", path: "src/" } },
   ],
 };
+
+/** One curl probe of a path on the dev box, exactly as the incident ran it. */
+const probe = (path: string) =>
+  `rtk curl -sk -o /dev/null -m 20 -w '%{http_code}' --resolve dev.aplg-learning.com:443:43.128.218.65 "https://dev.aplg-learning.com${path}"`;
+
+/** The nine paths from the incident: one command, nine different targets. */
+export const PROBED_PATHS = [
+  "/",
+  "/login",
+  "/news",
+  "/knowledge",
+  "/event",
+  "/functions/learning",
+  "/v1/course-list",
+  "/v1/topic-list",
+  "/api/health",
+];
+
+/**
+ * A loop over TARGETS, not over a call: one curl probed against nine paths
+ * inside one script. Nothing is repeated — the incident that showed a
+ * shared-token score cannot tell this from a wrapped re-issue of one command.
+ */
+export const codemodeMultiTargetProbe: NestedFixture = {
+  name: "codemode script probes 9 distinct paths with one curl",
+  script:
+    'const paths = ["/", "/login", "/news", "/knowledge", "/event", "/functions/learning", "/v1/course-list", "/v1/topic-list", "/api/health"];\nfor (const p of paths) { await tools.bash({ command: probe(p) }); }',
+  events: PROBED_PATHS.map((path, i) => ({
+    parent: "cm1",
+    id: `cm1/${i + 1}`,
+    tool: "bash",
+    args: { command: probe(path) },
+  })),
+};
+
+const POLL = "gh run list --branch main --limit 3 2>&1 | head -6";
+
+/**
+ * Wrapper drift INSIDE one script: the same poll re-issued with a different
+ * wrapper. The two commands differ from each other, yet both are the one poll —
+ * an in-script repeat, which the nested 2× rule must catch.
+ */
+export const codemodeWrapperPollLoop: NestedFixture = {
+  name: "codemode script re-issues one poll behind a sleep wrapper",
+  script: `await tools.bash({ command: ${JSON.stringify(POLL)} });\nawait tools.bash({ command: "sleep 150; " + ${JSON.stringify(POLL)} });`,
+  events: [
+    { parent: "cm1", id: "cm1/1", tool: "bash", args: { command: POLL } },
+    { parent: "cm1", id: "cm1/2", tool: "bash", args: { command: `sleep 150; ${POLL}` } },
+  ],
+};
+
+/** Top-level version of the same sweep: nine distinct probes, no repeat. */
+export const topLevelMultiTargetProbe: CallFixture = {
+  name: "nine distinct curl probes at top level (one command, nine targets)",
+  calls: PROBED_PATHS.map((path) => ({ tool: "bash", args: { command: probe(path) } })),
+};
+
+/** Top-level wrapper drift: one poll, re-issued behind sleep/timeout wrappers. */
+export const topLevelWrapperPollLoop: CallFixture = {
+  name: "one poll re-issued behind sleep and timeout wrappers",
+  calls: [
+    { tool: "bash", args: { command: POLL } },
+    { tool: "bash", args: { command: `sleep 150; ${POLL}` } },
+    { tool: "bash", args: { command: `timeout 30; ${POLL}` } },
+  ],
+};
