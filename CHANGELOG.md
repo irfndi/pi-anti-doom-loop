@@ -2,6 +2,12 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.0.17] — 2026-11-12
+
+### Fixed
+
+- **A loop over targets was reported as a loop over a command** — inside one codemode script, probing `/`, `/login`, `/news` … with the same curl was blocked on the second probe. Near-identical args were compared as a shared-token score over canonical JSON, where a one-character URL change still scores 0.85 and a genuinely wrapped poll scores 0.72: no threshold separates them. The comparison is now wrapper drift — same `command`, at most three tokens added or removed (`sleep 150; <cmd>`, `<cmd> | tail -3`) — run on the command text instead of the JSON blob, and entries are matched as a connected group so `poll`, `timeout 30; poll` and `sleep 150; poll` all count as one call. Exact repeats and the nested 2× rule are unchanged, so a repeated call still blocks.
+
 ## [0.0.16] — 2026-11-07
 
 ### Added
@@ -235,6 +241,7 @@ All notable changes to **pi-anti-doom-loop**.
 - GitHub Actions release workflow: quality gate → version bump guard → dry-run → publish, triggered by `v*` tags.
 - `pi-package` keyword + `pi` manifest for the pi.dev gallery.
 
+[0.0.17]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.16...v0.0.17
 [0.0.16]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.15...v0.0.16
 [0.0.7]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/irfndi/pi-anti-doom-loop/compare/v0.0.5...v0.0.6
