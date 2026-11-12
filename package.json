@@ -42,18 +42,18 @@
     "prepare": "effect-tsgo patch --no-typescript --oxlint --skip-missing"
   },
   "dependencies": {
-    "@effect/tsgo": "0.63.0",
+    "@effect/tsgo": "0.67.5",
     "better-result": "^3.0.0",
     "effect": "^4.0.0-rc.108"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@oxlint/plugins": "1.90.0",
+    "@oxlint/plugins": "1.92.0",
     "@types/node": "^22.0.0",
-    "oxfmt": "0.75.0",
-    "oxlint": "1.90.0",
-    "oxlint-tsgolint": "7.0.2005",
-    "typebox": "1.4.3",
+    "oxfmt": "0.77.0",
+    "oxlint": "1.92.0",
+    "oxlint-tsgolint": "7.0.2006",
+    "typebox": "1.4.5",
     "typescript": "^7.0.2"
   },
   "peerDependencies": {
